@@ -1,5 +1,5 @@
 # ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
-# Version: 0.2.4
+# Version: 0.2.5
 
 [CmdletBinding()]
 param(
@@ -575,19 +575,43 @@ function Check-IPv6AnyAny { param($Cfg)
   if($hits){ New-Finding 'ACL6-ANY-ANY' 'IPv6 any6 any6 present' 'High' $false $hits 'Restrict IPv6 ACL and bind to interface.' } else { New-Finding 'ACL6-ANY-ANY' 'No IPv6 any-any' 'Info' $true }
 }
 
-function Check-VPN { param($Cfg)
+function Check-VPN {
+  param($Cfg)
+
   $ikev1pol = @(); if($Cfg.Index.Contains('crypto ikev1 policy')){ $ikev1pol = $Cfg.Index['crypto ikev1 policy'] }
   $ikev2pol = @(); if($Cfg.Index.Contains('crypto ikev2 policy')){ $ikev2pol = $Cfg.Index['crypto ikev2 policy'] }
-  $hasCryptoMap = ($Cfg.Lines | Where-Object { $_ -match '^\s*crypto\s+map\s+\S+\s+\d+\s+' -or $_ -match '^\s*crypto\s+map\s+\S+\s+interface\s+\S+' })
-  $hasWebvpn = ($Cfg.Lines | Where-Object { $_ -match '^\s*webvpn\b' })
+  $hasCryptoMap = ($Cfg.Lines | Where-Object {
+    $_ -match '^\s*crypto\s+map\s+\S+\s+\d+\s+' -or $_ -match '^\s*crypto\s+map\s+\S+\s+interface\s+\S+'
+  })
 
-  if(($ikev1pol.Count -eq 0) -and ($ikev2pol.Count -eq 0) -and -not $hasCryptoMap -and -not $hasWebvpn){
+  # Собираем только осмысленные evidence из секции webvpn: "webvpn enable <iface>"
+  $webvpnEnable = New-Object System.Collections.Generic.List[string]
+  for($i=0;$i -lt $Cfg.Lines.Count; $i++){
+    if($Cfg.Lines[$i] -match '^\s*webvpn\b'){
+      for($j=$i+1; $j -lt $Cfg.Lines.Count -and $Cfg.Lines[$j] -match '^\s+'; $j++){
+        if($Cfg.Lines[$j] -match '^\s*enable\s+(\S+)'){
+          [void]$webvpnEnable.Add("webvpn " + $Cfg.Lines[$j].Trim())
+        }
+      }
+    }
+  }
+
+  if(($ikev1pol.Count -eq 0) -and ($ikev2pol.Count -eq 0) -and -not $hasCryptoMap -and ($webvpnEnable.Count -eq 0)){
     return New-Finding 'VPN-IKE' 'No VPN/IKE found' 'Info' $true
   }
-  if($ikev1pol.Count -gt 0 -and $ikev2pol.Count -eq 0){ return New-Finding 'VPN-IKE' 'IKEv1 only' 'Medium' $false $ikev1pol 'Migrate to IKEv2.' }
-  if($ikev2pol.Count -gt 0 -and $ikev1pol.Count -gt 0){ return New-Finding 'VPN-IKE' 'Both IKEv1 and IKEv2' 'Low' $false ($ikev1pol+$ikev2pol) 'Prefer IKEv2 only.' }
-  if($hasCryptoMap -or $hasWebvpn){
-    if($ikev2pol.Count -eq 0){ return New-Finding 'VPN-IKE' 'VPN present (no explicit ikev2 policies found)' 'Low' $false (@($hasCryptoMap)+@($hasWebvpn)) 'Define IKEv2 policies and prefer them.' }
+  if($ikev1pol.Count -gt 0 -and $ikev2pol.Count -eq 0){
+    return New-Finding 'VPN-IKE' 'IKEv1 only' 'Medium' $false $ikev1pol 'Migrate to IKEv2.'
+  }
+  if($ikev2pol.Count -gt 0 -and $ikev1pol.Count -gt 0){
+    return New-Finding 'VPN-IKE' 'Both IKEv1 and IKEv2' 'Low' $false ($ikev1pol+$ikev2pol) 'Prefer IKEv2 only.'
+  }
+  if($hasCryptoMap -or $webvpnEnable.Count -gt 0){
+    if($ikev2pol.Count -eq 0){
+      $ev = @()
+      if($hasCryptoMap){ $ev += $hasCryptoMap }
+      if($webvpnEnable.Count -gt 0){ $ev += ($webvpnEnable | Select-Object -Unique) }
+      return New-Finding 'VPN-IKE' 'VPN present (no explicit ikev2 policies found)' 'Low' $false $ev 'Define IKEv2 policies and prefer them.'
+    }
   }
   return New-Finding 'VPN-IKE' 'IKEv2 present' 'Info' $true $ikev2pol
 }
@@ -735,11 +759,11 @@ function Check-WebVPNCiphers {
 
   # 1) Явные слабые директивы (без заголовков "webvpn")
   $patterns = @(
-    '^\s*ssl\s+encryption\s+.*\b(rc4|md5|3des|des)\b',              # ssl encryption rc4-md5 / 3des / des
-    '^\s*ssl\s+encryption\s+.*\bsha1\b',                            # CBC+SHA1
-    '^\s*ssl\s+cipher\s+dtlsv?1\.0.*\b(rc4|md5|3des|des|sha1)\b',   # DTLSv1.0 слабые
-    '^\s*anyconnect\s+ssl\s+cipher\s+rc4-md5\b',                    # RC4-MD5 в GP
-    '^\s*anyconnect\s+ssl\s+cipher\b.*\b(rc4|md5|3des|des|sha1)\b'  # любые слабые варианты в GP
+    '^\s*ssl\s+encryption\s+.*\b(rc4|md5|3des|(?<![a-z])des(?![a-z]))\b', # rc4 / md5 / 3des / des
+    '^\s*ssl\s+encryption\s+.*\bsha1\b',                                  # CBC+SHA1
+    '^\s*ssl\s+cipher\s+dtlsv?1(?:\.0)?\b.*\b(rc4|md5|3des|(?<![a-z])des(?![a-z])|sha1)\b',
+    '^\s*anyconnect\s+ssl\s+cipher\s+rc4-md5\b',
+    '^\s*anyconnect\s+ssl\s+cipher\b.*\b(rc4|md5|3des|(?<![a-z])des(?![a-z])|sha1)\b'
   )
   foreach($line in $Cfg.Lines){
     foreach($rx in $patterns){
@@ -747,24 +771,21 @@ function Check-WebVPNCiphers {
     }
   }
 
-  # 2) Кастомные списки DTLS: ssl cipher dtlsN custom "AES256-SHA:AES128-SHA:..."
+  # 2) Кастомные списки DTLS/TLS: ssl cipher dtls1 custom "<list>", ssl cipher custom "<list>"
   foreach($line in $Cfg.Lines){
-    if($line -match '^\s*ssl\s+cipher\s+dtls\d+(?:\.0)?\s+custom\s+"([^"]+)"'){
+    # DTLS custom
+    if($line -match '^\s*ssl\s+cipher\s+dtls(v?1(?:\.0)?)\s+custom\s+"([^"]+)"'){
+      $list = $matches[2] -split '[:;, ]+' | Where-Object { $_ }
+      $bad  = @($list | ForEach-Object { $_.ToUpperInvariant() } |
+                Where-Object { $_ -match 'RC4|MD5|3DES|(^|[-_])DES($|[-_])' -or $_ -match 'SHA(?!256|384|512)' })
+      if($bad.Count -gt 0){ [void]$weak.Add($line + '  ! WEAK: ' + ($bad -join ', ')) }
+    }
+    # TLS custom (не DTLS)
+    elseif($line -match '^\s*ssl\s+cipher\s+custom\s+"([^"]+)"'){
       $list = $matches[1] -split '[:;, ]+' | Where-Object { $_ }
-      $flagged = $false
-      foreach($c in $list){
-        $u = $c.ToUpperInvariant()
-        # ciphers вида AES256-SHA / ECDHE-RSA-AES128-SHA — это CBC+SHA1
-        if($u -match 'RC4|MD5|3DES|(^|[-_])DES($|[-_])' -or $u -match 'SHA(?!256|384|512)'){
-          # Добавляем строку с пояснением, какие элементы слабые
-          if(-not $flagged){
-            $bad = ($list | ForEach-Object { $_.ToUpperInvariant() } | Where-Object { $_ -match 'RC4|MD5|3DES|(^|[-_])DES($|[-_])' -or $_ -match 'SHA(?!256|384|512)' })
-            $note = if($bad){ '  ! WEAK: ' + ($bad -join ', ') } else { '' }
-            [void]$weak.Add($line + $note)
-            $flagged = $true
-          }
-        }
-      }
+      $bad  = @($list | ForEach-Object { $_.ToUpperInvariant() } |
+                Where-Object { $_ -match 'RC4|MD5|3DES|(^|[-_])DES($|[-_])' -or $_ -match 'SHA(?!256|384|512)' })
+      if($bad.Count -gt 0){ [void]$weak.Add($line + '  ! WEAK: ' + ($bad -join ', ')) }
     }
   }
 
