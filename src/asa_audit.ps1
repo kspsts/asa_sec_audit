@@ -1,5 +1,5 @@
-# ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
-# Version: 0.5.3
+﻿# ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
+# Version: 0.5.4
 
 [CmdletBinding()]
 param(
