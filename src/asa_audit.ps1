@@ -260,33 +260,101 @@ function Check-DangerousServicesAnyAny {
 
 function Check-ACLForServers {
   param($Cfg,$Obj)
-  $servers = Get-AllServerIPs -Obj $Obj
-  if(-not $servers){ return New-Finding 'SRV-ACL' 'Servers ACL check (objects/groups)' 'Info' $true }
 
-  $aclLines = @()
-  if($Cfg.Index.Contains('access-list')){ $aclLines = $Cfg.Index['access-list'] }
+  # --- собрать множество имён "серверных" объектов/групп ---
+  $serverNames = [System.Collections.Generic.HashSet[string]]::new()
+  if($Obj -and $Obj.ObjectHosts){ foreach($k in $Obj.ObjectHosts.Keys){ [void]$serverNames.Add($k) } }
+  if($Obj -and $Obj.ObjectSubnets){ foreach($k in $Obj.ObjectSubnets.Keys){ [void]$serverNames.Add($k) } }
+  if($Obj -and $Obj.GroupHosts){ foreach($k in $Obj.GroupHosts.Keys){ if($Obj.GroupHosts[$k].Count -gt 0){ [void]$serverNames.Add($k) } } }
+  if($Obj -and $Obj.GroupSubnets){ foreach($k in $Obj.GroupSubnets.Keys){ if($Obj.GroupSubnets[$k].Count -gt 0){ [void]$serverNames.Add($k) } } }
 
-  $ev = New-Object System.Collections.Generic.List[string]
+  if($serverNames.Count -eq 0){
+    return New-Finding 'SRV-ACL' 'Servers ACL check (objects/groups)' 'Info' $true
+  }
 
-  foreach($ip in $servers){
-    $esc = [regex]::Escape($ip)
-    $lines1 = @($aclLines | Where-Object { ($_ -match '\bpermit\b') -and ($_ -match ("\b$esc\b")) -and (($_ -match '\bany\b') -or ($_ -match '\bany6\b') -or ($_ -match '\b0\.0\.0\.0\s+0\.0\.0\.0\b')) })
-    foreach($l in $lines1){ if($null -ne $l){ [void]$ev.Add([string]$l) } }
+  # --- строки ACL + карта привязок (name -> [ {Interface,Direction}... ]) ---
+  $aclLines = @(); if($Cfg.Index.Contains('access-list')){ $aclLines = $Cfg.Index['access-list'] }
 
-    foreach($grp in $Obj.GroupHosts.Keys){
-      if($Obj.GroupHosts[$grp].Contains($ip)){
-        $grpEsc = [regex]::Escape($grp)
-        $lines2 = @($aclLines | Where-Object { ($_ -match '\bpermit\b') -and ($_ -match ("\bobject-group\s+$grpEsc\b")) -and (($_ -match '\bany\b') -or ($_ -match '\bany6\b') -or ($_ -match '\b0\.0\.0\.0\s+0\.0\.0\.0\b')) })
-        foreach($l in $lines2){ if($null -ne $l){ [void]$ev.Add([string]$l) } }
+  $bindMap = @{}
+  if($Cfg.Index.Contains('access-group')){
+    foreach($g in $Cfg.Index['access-group']){
+      $m = [regex]::Match($g,'^\s*access-group\s+(?<name>\S+)\s+(?<dir>in|out)\s+(?:interface\s+(?<if>\S+)|global)\s*$', 'IgnoreCase')
+      if($m.Success){
+        $n = $m.Groups['name'].Value
+        if(-not $bindMap.ContainsKey($n)){ $bindMap[$n] = New-Object System.Collections.Generic.List[object] }
+        $ifc = if($m.Groups['if'].Success){ $m.Groups['if'].Value } else { 'global' }
+        [void]$bindMap[$n].Add([PSCustomObject]@{ Interface=$ifc; Direction=$m.Groups['dir'].Value })
       }
     }
   }
 
-  if($ev.Count -gt 0){
-    New-Finding 'SRV-ACL' 'Servers reachable from ANY (ip/group)' 'High' $false ($ev | Select-Object -Unique) 'Limit sources to trusted ranges.'
-  } else {
-    New-Finding 'SRV-ACL' 'No server ANY exposure found' 'Info' $true
+  # --- накопители находок по направлениям ---
+  $evAnyToSrv = New-Object System.Collections.Generic.List[string]  # any -> server (экспозиция)
+  $evSrvToAny = New-Object System.Collections.Generic.List[string]  # server -> any (подозрительно для jump-хостов и т.п.)
+
+  foreach($ln in $aclLines){
+    $p = Parse-AclLine -Line $ln
+    if(-not $p -or $p.Action -ne 'permit'){ continue }
+
+    # аннотация привязки
+    $bindTxt = '  [UNBOUND]'
+    if($bindMap.ContainsKey($p.Name)){
+      $bindTxt = '  ' + (($bindMap[$p.Name] | ForEach-Object { "[{0} {1}]" -f $_.Interface,$_.Direction }) -join ' ')
+    }
+
+    # any -> server ?
+    $isServerDst = (($p.DstType -in @('object','og')) -and $serverNames.Contains($p.Dst))
+    $anySrc = ($p.SrcType -eq 'any' -or ($p.SrcType -eq 'subnet' -and $p.Src -match '^0\.0\.0\.0\s+0\.0\.0\.0$'))
+    if($isServerDst -and $anySrc){
+      [void]$evAnyToSrv.Add($ln + $bindTxt)
+      continue
+    }
+
+    # server -> any ?
+    $isServerSrc = (($p.SrcType -in @('object','og')) -and $serverNames.Contains($p.Src))
+    $anyDst = ($p.DstType -eq 'any' -or ($p.DstType -eq 'subnet' -and $p.Dst -match '^0\.0\.0\.0\s+0\.0\.0\.0$'))
+    if($isServerSrc -and $anyDst){
+      [void]$evSrvToAny.Add($ln + $bindTxt + '  [Server as source -> any]')
+      continue
+    }
   }
+
+  # --- простая проверка «широких» подсетей внутри server-групп (tsX/rdgX и пр.) ---
+  $broadGroups = New-Object System.Collections.Generic.List[string]
+  if($Obj -and $Obj.GroupSubnets){
+    foreach($g in $Obj.GroupSubnets.Keys){
+      foreach($sn in $Obj.GroupSubnets[$g]){
+        $parts = $sn -split '\s+'
+        if($parts.Count -ge 2){
+          $mask = $parts[1]
+          if($mask -eq '255.0.0.0' -or $mask -eq '255.255.0.0'){
+            [void]$broadGroups.Add("object-group $g includes broad subnet $sn")
+          }
+        }
+      }
+    }
+  }
+
+  if($evAnyToSrv.Count -eq 0 -and $evSrvToAny.Count -eq 0){
+    return New-Finding 'SRV-ACL' 'No server ANY exposure found' 'Info' $true
+  }
+
+  # --- вычислить severity: ANY->SERVER на outside in => High; только SERVER->ANY без outside in => Medium ---
+  $outsideIn = $false
+  foreach($l in ($evAnyToSrv + $evSrvToAny)){
+    if($l -match '\[outside in\]'){ $outsideIn = $true; break }
+  }
+  $sev = 'High'
+  if(-not $outsideIn -and $evAnyToSrv.Count -eq 0 -and $evSrvToAny.Count -gt 0){ $sev = 'Medium' }
+
+  # --- собрать evidence ---
+  $evid = New-Object System.Collections.Generic.List[string]
+  if($evAnyToSrv.Count -gt 0){ [void]$evid.Add('[ANY -> SERVER]'); foreach($x in $evAnyToSrv){ [void]$evid.Add([string]$x) } }
+  if($evSrvToAny.Count -gt 0){ [void]$evid.Add('[SERVER -> ANY]'); foreach($x in $evSrvToAny){ [void]$evid.Add([string]$x) } }
+  if($broadGroups.Count -gt 0){ [void]$evid.Add('[GROUP CONTENT]'); foreach($x in $broadGroups){ [void]$evid.Add([string]$x) } }
+
+  New-Finding 'SRV-ACL' 'Server-related ANY exposure (direction-aware)' $sev $false ($evid | Select-Object -Unique) `
+    'Limit sources to trusted ranges; ensure server objects are on destination side; review group contents.'
 }
 
 function Check-AccessGroupBinding { param($Cfg)
