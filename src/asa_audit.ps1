@@ -1,5 +1,5 @@
 # ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
-# Version: 0.4.2
+# Version: 0.4.3
 
 [CmdletBinding()]
 param(
@@ -1157,10 +1157,15 @@ function Check-ManagementAccess {
 function Check-DMZtoInsideDeep {
   param($Cfg,$Obj)
 
+  trap {
+    Write-Error ("DMZ-INSIDE check failed: {0}" -f $_.Exception.Message)
+    continue
+  }
+
   # ---------- helpers ----------
   function New-Set { [System.Collections.Generic.HashSet[string]]::new() }
   function Is-RFC1918([string]$ip) {
-    if(-not $ip){ return $false }
+    if([string]::IsNullOrWhiteSpace($ip)){ return $false }
     if($ip -match '^10\.') { return $true }
     if($ip -match '^192\.168\.') { return $true }
     if($ip -match '^172\.(1[6-9]|2\d|3[0-1])\.') { return $true }
@@ -1168,15 +1173,14 @@ function Check-DMZtoInsideDeep {
   }
   function Bind-Map($Cfg){
     $map=@{}
-    if($Cfg.Index.Contains('access-group')){
-      foreach($g in $Cfg.Index['access-group']){
-        $m=[regex]::Match($g,'^\s*access-group\s+(?<name>\S+)\s+(?<dir>in|out)\s+(?:interface\s+(?<if>\S+)|global)\s*$', 'IgnoreCase')
-        if($m.Success){
-          $n=$m.Groups['name'].Value
-          if(-not $map.ContainsKey($n)){ $map[$n]=New-Object System.Collections.Generic.List[object] }
-          $ifc= if($m.Groups['if'].Success){ $m.Groups['if'].Value } else { 'global' }
-          [void]$map[$n].Add([PSCustomObject]@{ Interface=$ifc; Direction=$m.Groups['dir'].Value })
-        }
+    $accessGroups = Get-IndexLines $Cfg 'access-group'
+    foreach($g in $accessGroups){
+      $m=[regex]::Match($g,'^\s*access-group\s+(?<name>\S+)\s+(?<dir>in|out)\s+(?:interface\s+(?<if>\S+)|global)\s*$', 'IgnoreCase')
+      if($m.Success){
+        $n=$m.Groups['name'].Value
+        if(-not $map.ContainsKey($n)){ $map[$n]=New-Object System.Collections.Generic.List[object] }
+        $ifc= if($m.Groups['if'].Success){ $m.Groups['if'].Value } else { 'global' }
+        [void]$map[$n].Add([PSCustomObject]@{ Interface=$ifc; Direction=$m.Groups['dir'].Value })
       }
     }
     $map
@@ -1205,29 +1209,38 @@ function Check-DMZtoInsideDeep {
   $dmzNameSet    = New-Set
   $insideNameSet = New-Set
 
-  $objKeys = @()
-  if($Obj -and $Obj.ObjectHosts){    $objKeys += $Obj.ObjectHosts.Keys }
-  if($Obj -and $Obj.ObjectSubnets){  $objKeys += $Obj.ObjectSubnets.Keys }
-
-  foreach($k in $objKeys){
-    if($k -match '(?i)\b(dmz|guest|partner)\b'){   [void]$dmzNameSet.Add($k) }
-    if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ [void]$insideNameSet.Add($k) }
-  }
-
-  $grpKeys = @()
-  if($Obj -and $Obj.GroupHosts){     $grpKeys += $Obj.GroupHosts.Keys }
-  if($Obj -and $Obj.GroupSubnets){   $grpKeys += $Obj.GroupSubnets.Keys }
-
-  foreach($k in $grpKeys){
-    if($k -match '(?i)\b(dmz|guest|partner)\b'){   [void]$dmzNameSet.Add($k) }
-    if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ [void]$insideNameSet.Add($k) }
+  if($Obj){
+    if($Obj.ObjectHosts){
+      foreach($k in $Obj.ObjectHosts.Keys){
+        if($k -match '(?i)\b(dmz|guest|partner)\b'){ [void]$dmzNameSet.Add($k) }
+        if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ [void]$insideNameSet.Add($k) }
+      }
+    }
+    if($Obj.ObjectSubnets){
+      foreach($k in $Obj.ObjectSubnets.Keys){
+        if($k -match '(?i)\b(dmz|guest|partner)\b'){ [void]$dmzNameSet.Add($k) }
+        if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ [void]$insideNameSet.Add($k) }
+      }
+    }
+    if($Obj.GroupHosts){
+      foreach($k in $Obj.GroupHosts.Keys){
+        if($k -match '(?i)\b(dmz|guest|partner)\b'){ [void]$dmzNameSet.Add($k) }
+        if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ [void]$insideNameSet.Add($k) }
+      }
+    }
+    if($Obj.GroupSubnets){
+      foreach($k in $Obj.GroupSubnets.Keys){
+        if($k -match '(?i)\b(dmz|guest|partner)\b'){ [void]$dmzNameSet.Add($k) }
+        if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ [void]$insideNameSet.Add($k) }
+      }
+    }
   }
 
   # ---------- ACL binding map ----------
   $bindMap = Bind-Map $Cfg
 
   # ---------- scan ACLs ----------
-  $aclLines = @(); if($Cfg.Index.Contains('access-list')){ $aclLines = $Cfg.Index['access-list'] }
+  $aclLines = Get-IndexLines $Cfg 'access-list'
   if($aclLines.Count -eq 0){
     return New-Finding 'DMZ-INSIDE' 'No ACLs found for DMZ->inside analysis' 'Info' $true
   }
@@ -1258,23 +1271,23 @@ function Check-DMZtoInsideDeep {
 
     # аннотация привязки
     $bindTxt = '  [UNBOUND]'
-    if($bindMap.ContainsKey($p.Name)){
+    if($p.Name -and $bindMap.ContainsKey($p.Name)){
       $bindTxt = '  ' + (($bindMap[$p.Name] | ForEach-Object { "[{0} {1}]" -f $_.Interface,$_.Direction }) -join ' ')
     }
 
     # источник DMZ?
     $isDmzSrc =
-      (($p.SrcType -in @('object','og')) -and $dmzNameSet.Contains($p.Src)) -or
-      ($p.SrcType -eq 'subnet' -and $p.Src -match '^172\.1[6-9]\.|^172\.2\d\.|^172\.3[01]\.' -and $p.Name -match '(?i)dmz') -or
-      ($p.SrcType -eq 'host'   -and $p.Name -match '(?i)dmz')
+      (($p.SrcType -in @('object','og')) -and $p.Src -and $dmzNameSet.Contains($p.Src)) -or
+      ($p.SrcType -eq 'subnet' -and $p.Src -match '^172\.(1[6-9]|2\d|3[01])\.' -and $p.Name -and $p.Name -match '(?i)dmz') -or
+      ($p.SrcType -eq 'host'   -and $p.Name -and $p.Name -match '(?i)dmz')
 
     # назначение INSIDE?
     $isInsideDst =
-      (($p.DstType -in @('object','og')) -and $insideNameSet.Contains($p.Dst)) -or
-      ($p.DstType -eq 'subnet' -and ($p.Dst -match '^\d{1,3}(?:\.\d{1,3}){3}\s+\d{1,3}(?:\.\d{1,3}){3}$' -and (Is-RFC1918 ($p.Dst -split '\s+')[0])) ) -or
-      ($p.DstType -eq 'host'   -and (Is-RFC1918 $p.Dst))
+      (($p.DstType -in @('object','og')) -and $p.Dst -and $insideNameSet.Contains($p.Dst)) -or
+      ($p.DstType -eq 'subnet' -and $p.Dst -and ($p.Dst -match '^\d{1,3}(?:\.\d{1,3}){3}\s+\d{1,3}(?:\.\d{1,3}){3}$' -and (Is-RFC1918 ($p.Dst -split '\s+')[0])) ) -or
+      ($p.DstType -eq 'host'   -and $p.Dst -and (Is-RFC1918 $p.Dst))
 
-    $anyDst = ($p.DstType -eq 'any' -or ($p.DstType -eq 'subnet' -and $p.Dst -match '^0\.0\.0\.0\s+0\.0\.0\.0$'))
+    $anyDst = ($p.DstType -eq 'any' -or ($p.DstType -eq 'subnet' -and $p.Dst -and $p.Dst -match '^0\.0\.0\.0\s+0\.0\.0\.0$'))
 
     if($isDmzSrc -and $isInsideDst){
       [void]$evStrict.Add($ln + $bindTxt)
@@ -1303,9 +1316,9 @@ function Check-DMZtoInsideDeep {
     if($l -match '\[inside in\]'){  $insideIn=$true }
   }
   if($evStrict.Count -gt 0){
-    foreach($ln in $evStrict){
-      $p = Parse-AclLine -Line $ln
-      if($p -and (Is-WideService $p.Service)){ $sev='High'; break }
+    foreach($ln2 in $evStrict){
+      $p2 = Parse-AclLine -Line $ln2
+      if($p2 -and (Is-WideService $p2.Service)){ $sev='High'; break }
     }
     if($sev -ne 'High' -and ($outsideIn -or $insideIn)){ $sev='High' }
   } elseif($evBroad.Count -gt 0){
