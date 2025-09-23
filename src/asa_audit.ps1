@@ -1,5 +1,5 @@
 # ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
-# Version: 0.4.7
+# Version: 0.4.8
 
 [CmdletBinding()]
 param(
@@ -44,6 +44,11 @@ function New-Finding {
   [PSCustomObject]@{ Id=$Id;Title=$Title;Severity=$Severity;Passed=$Passed;Evidence=$Evidence;Recommendation=$Recommendation }
 }
 
+function Get-IndexLines {
+  param($Cfg, $Key)
+  if($Cfg -and $Cfg.Index -and $Cfg.Index.Contains($Key)) { @($Cfg.Index[$Key]) } else { @() }
+}
+
 function Write-AsaReport {
   param([PSCustomObject[]]$Findings,[string]$OutJson,[switch]$Chart)
   $sorted = $Findings | Sort-Object @{Expression='Passed';Descending=$true}, @{Expression='Severity';Descending=$true}, 'Id'
@@ -63,11 +68,6 @@ function Write-AsaReport {
     Write-Host "Severity histogram:" -ForegroundColor Cyan
     foreach($g in $bySev){ $bar = ('#' * $g.Count); Write-Host ("{0,-6} {1,3} | {2}" -f $g.Name,$g.Count,$bar) }
   }
-}
-
-function Get-IndexLines {
-  param($Cfg, $Key)
-  if($Cfg -and $Cfg.Index -and $Cfg.Index.Contains($Key)) { @($Cfg.Index[$Key]) } else { @() }
 }
 
 # ============ Parsing: objects / groups ============
