@@ -1,5 +1,5 @@
 # ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
-# Version: 0.4.4
+# Version: 0.4.5
 
 [CmdletBinding()]
 param(
@@ -1162,8 +1162,11 @@ function Check-DMZtoInsideDeep {
     continue
   }
 
-  # ---------- helpers ----------
+  # --- локальные utils (без внешних зависимостей) ---
   function New-Set { [System.Collections.Generic.HashSet[string]]::new() }
+  function Get-IndexLinesLocal { param($Cfg,$Key)
+    if($Cfg -and $Cfg.Index -and $Cfg.Index.Contains($Key)){ @($Cfg.Index[$Key]) } else { @() }
+  }
   function Is-RFC1918([string]$ip) {
     if([string]::IsNullOrWhiteSpace($ip)){ return $false }
     if($ip -match '^10\.') { return $true }
@@ -1171,9 +1174,9 @@ function Check-DMZtoInsideDeep {
     if($ip -match '^172\.(1[6-9]|2\d|3[0-1])\.') { return $true }
     return $false
   }
-  function Bind-Map($Cfg){
+  function Bind-MapLocal($Cfg){
     $map=@{}
-    $accessGroups = Get-IndexLines $Cfg 'access-group'
+    $accessGroups = Get-IndexLinesLocal $Cfg 'access-group'
     foreach($g in $accessGroups){
       $m=[regex]::Match($g,'^\s*access-group\s+(?<name>\S+)\s+(?<dir>in|out)\s+(?:interface\s+(?<if>\S+)|global)\s*$', 'IgnoreCase')
       if($m.Success){
@@ -1186,13 +1189,19 @@ function Check-DMZtoInsideDeep {
     $map
   }
 
-  # ---------- detect interface names ----------
+  # --- входные данные безопасно ---
+  $lines = @(); if($Cfg -and $Cfg.Lines){ $lines = @($Cfg.Lines) }
+  if($lines.Count -eq 0){
+    return New-Finding 'DMZ-INSIDE' 'No lines to analyze' 'Info' $true
+  }
+
+  # --- nameif извлечение ---
   $nameifs=@{}  # phys_if -> nameif
-  for($i=0;$i -lt $Cfg.Lines.Count;$i++){
-    if($Cfg.Lines[$i] -match '^\s*interface\s+(\S+)'){
+  for($i=0;$i -lt $lines.Count;$i++){
+    if($lines[$i] -match '^\s*interface\s+(\S+)'){
       $cur=$matches[1]
-      for($j=$i+1;$j -lt $Cfg.Lines.Count -and $Cfg.Lines[$j] -match '^\s+';$j++){
-        if($Cfg.Lines[$j] -match '^\s*nameif\s+(\S+)'){ $nameifs[$cur]=$matches[1]; break }
+      for($j=$i+1;$j -lt $lines.Count -and $lines[$j] -match '^\s+';$j++){
+        if($lines[$j] -match '^\s*nameif\s+(\S+)'){ $nameifs[$cur]=$matches[1]; break }
       }
     }
   }
@@ -1205,7 +1214,7 @@ function Check-DMZtoInsideDeep {
   foreach($n in $nameifs.Values){ if($n -match '^(?i)(inside|internal|corp|intranet|lan|pci)$'){ [void]$insideIfSet.Add($n) } }
   if($insideIfSet.Count -eq 0){ [void]$insideIfSet.Add('inside') } # эвристика
 
-  # ---------- build name sets from objects/groups ----------
+  # --- наборы имён из объектов/групп ---
   $dmzNameSet    = New-Set
   $insideNameSet = New-Set
 
@@ -1236,11 +1245,11 @@ function Check-DMZtoInsideDeep {
     }
   }
 
-  # ---------- ACL binding map ----------
-  $bindMap = Bind-Map $Cfg
+  # --- карта привязок ACL ---
+  $bindMap = Bind-MapLocal $Cfg
 
-  # ---------- scan ACLs ----------
-  $aclLines = Get-IndexLines $Cfg 'access-list'
+  # --- сами ACL ---
+  $aclLines = Get-IndexLinesLocal $Cfg 'access-list'
   if($aclLines.Count -eq 0){
     return New-Finding 'DMZ-INSIDE' 'No ACLs found for DMZ->inside analysis' 'Info' $true
   }
