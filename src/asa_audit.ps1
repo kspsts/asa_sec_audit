@@ -1,5 +1,5 @@
 # ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
-# Version: 0.4.5
+# Version: 0.4.6
 
 [CmdletBinding()]
 param(
@@ -63,6 +63,11 @@ function Write-AsaReport {
     Write-Host "Severity histogram:" -ForegroundColor Cyan
     foreach($g in $bySev){ $bar = ('#' * $g.Count); Write-Host ("{0,-6} {1,3} | {2}" -f $g.Name,$g.Count,$bar) }
   }
+}
+
+function Get-IndexLines {
+  param($Cfg, $Key)
+  if($Cfg -and $Cfg.Index -and $Cfg.Index.Contains($Key)) { @($Cfg.Index[$Key]) } else { @() }
 }
 
 # ============ Parsing: objects / groups ============
