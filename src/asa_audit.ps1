@@ -1,5 +1,5 @@
 # ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
-# Version: 0.5.0
+# Version: 0.5.1
 
 [CmdletBinding()]
 param(
@@ -1350,14 +1350,15 @@ function Check-DMZtoInsideDeep {
 function Check-ServerEgressNAT {
   param($Cfg,$Obj)
 
-  # --- локальные хелперы ---
+  # --- helpers (null-safe, PS5.1-compatible) ---
   function _E($x){ if($null -eq $x){ @() } elseif($x -is [array]){ @($x) } else { @($x) } }
-  function _Idx($k){ if($Cfg -and $Cfg.Index -and $Cfg.Index.Contains($k)){ @($Cfg.Index[$k]) } else { @() } }
+  function _Idx($cfg,$k){ if($cfg -and $cfg.Index -and $cfg.Index.Contains($k)){ @($cfg.Index[$k]) } else { @() } }
+  function _Keys($h){ if($h -and $h.PSObject.Properties['Keys']){ @($h.Keys) } else { @() } }
   function _IsRFC1918([string]$ip){
     if([string]::IsNullOrWhiteSpace($ip)){ return $false }
-    if($ip -match '^10\.') { return $true }
-    if($ip -match '^192\.168\.') { return $true }
-    if($ip -match '^172\.(1[6-9]|2\d|3[0-1])\.') { return $true }
+    if($ip -match '^10\.'){ return $true }
+    if($ip -match '^192\.168\.'){ return $true }
+    if($ip -match '^172\.(1[6-9]|2\d|3[0-1])\.'){ return $true }
     $false
   }
   function _NameFromRef([string]$ref){
@@ -1368,26 +1369,24 @@ function Check-ServerEgressNAT {
   $lines = @(); if($Cfg -and $Cfg.Lines){ $lines = @($Cfg.Lines) }
   if($lines.Count -eq 0){ return New-Finding 'SRV-NAT' 'No lines to analyze' 'Info' $true }
 
-  # --- эвристика серверных имён ---
+  # --- собрать "серверные" имена (эвристика) ---
   $serverNames = New-Object System.Collections.Generic.HashSet[string]
   $nameHint = '(?i)(server|srv|app|web|www|db|sql|rdp|ts|jump|bastion|proxy|gw|dmz)'
-  foreach($k in @(
-    @(_E($Obj?.ObjectHosts?.Keys));
-    @(_E($Obj?.ObjectSubnets?.Keys));
-    @(_E($Obj?.GroupHosts?.Keys));
-    @(_E($Obj?.GroupSubnets?.Keys))
-  ) | Where-Object { $_ }){
-    if($k -match $nameHint){ [void]$serverNames.Add($k) }
-  }
+
+  foreach($k in _Keys($Obj.ObjectHosts)){ if($k -match $nameHint){ [void]$serverNames.Add($k) } }
+  foreach($k in _Keys($Obj.ObjectSubnets)){ if($k -match $nameHint){ [void]$serverNames.Add($k) } }
+  foreach($k in _Keys($Obj.GroupHosts)){ if($k -match $nameHint){ [void]$serverNames.Add($k) } }
+  foreach($k in _Keys($Obj.GroupSubnets)){ if($k -match $nameHint){ [void]$serverNames.Add($k) } }
+
   if($serverNames.Count -eq 0 -and $Obj -and $Obj.GroupHosts){
-    foreach($g in $Obj.GroupHosts.Keys){
+    foreach($g in _Keys($Obj.GroupHosts)){
       if($g -match '(?i)(dmz|online|partner|inside|internal|corp|lan)'){
-        foreach($h in $Obj.GroupHosts[$g]){ [void]$serverNames.Add($h) }
+        foreach($h in _E($Obj.GroupHosts[$g])){ if($h){ [void]$serverNames.Add($h) } }
       }
     }
   }
 
-  # --- собрать NAT к outside (object-NAT + twice NAT, включая after-auto/manual/policy NAT/identity/route-lookup) ---
+  # --- парс NAT к outside (object-NAT, twice/sectional, policy, identity, route-lookup) ---
   $toOutsideNat  = New-Object System.Collections.Generic.List[string]
   $natSrcNames   = New-Object System.Collections.Generic.HashSet[string]
   $identityNat   = New-Object System.Collections.Generic.List[string]
@@ -1398,8 +1397,8 @@ function Check-ServerEgressNAT {
   for($i=0; $i -lt $lines.Count; $i++){
     $ln = $lines[$i]
 
-    # object network блок
     if($ln -match '^\s*object\s+network\s+(\S+)'){ $curObj=$matches[1]; continue }
+
     if($curObj){
       if($ln -match '^\s*nat\s*\((?<src>\S+)\s*,\s*(?<dst>\S+)\)\s*(?<where>after-auto|manual)?\s*(?<type>dynamic|static|identity)\s+(?<what>interface|\S+)(?<tail>.*)$'){
         if($matches['dst'] -match '^(?i)outside'){
@@ -1410,11 +1409,10 @@ function Check-ServerEgressNAT {
           if($matches['tail'] -match '\broute-lookup\b'){ [void]$routeLookup.Add($rec) }
         }
       }
-      if($ln -notmatch '^\s+') { $curObj=$null } # выход из блока
+      if($ln -notmatch '^\s+') { $curObj=$null }
       continue
     }
 
-    # секционный/двойной NAT, включая after-auto/manual и policy NAT (destination ...)
     if($ln -match '^\s*nat\s*\((?<srcif>\S+)\s*,\s*(?<dstif>\S+)\)\s*(?<where>after-auto|manual)?\s+source\s+(?<stype>dynamic|static|identity)\s+(?<sobj>(object-group|object)\s+\S+|\S+)(?<rest>.*)$'){
       if($matches['dstif'] -match '^(?i)outside'){
         $rec = $ln.Trim()
@@ -1433,56 +1431,53 @@ function Check-ServerEgressNAT {
     return New-Finding 'SRV-NAT' 'No server egress NAT to outside detected (heuristic)' 'Info' $true
   }
 
-  # --- ACL, разрешающие исход "к any" или слишком широко для тех же источников ---
-  $aclLines = _Idx 'access-list'
+  # --- ACL для исхода "к any"/широкие ---
+  $aclLines = _Idx $Cfg 'access-list'
   $egressWide = New-Object System.Collections.Generic.List[string]
   $egressPortsWide = New-Object System.Collections.Generic.List[string]
 
   foreach($ln in $aclLines){
     if($ln -match '^\s*access-list\s+(\S+)\s+extended\s+permit\s+(?<proto>\S+)\s+(?<srcType>object-group|object|host|any|\S+)\s+(?<src>\S+)\s+(?<dstType>any|object-group|object|host|\S+)\s+(?<dst>\S+)(?<tail>.*)$'){
       $srcType=$matches['srcType']; $src=$matches['src']; $dstType=$matches['dstType']; $dst=$matches['dst']; $proto=$matches['proto']; $tail=$matches['tail']
-      $srcName = _NameFromRef("$srcType $src".Trim())
+      $srcName = _NameFromRef(("$srcType $src").Trim())
       $isNatSrc = ($natSrcNames.Contains($srcName) -or $serverNames.Contains($srcName))
       if(-not $isNatSrc){ continue }
 
       $isAnyDst = ($dstType -eq 'any' -or $dst -match '^0\.0\.0\.0(\s+0\.0\.0\.0)?$')
       $dstIsPublic = $false
-      if($dstType -match '^(host|object|object-group|\d+\.\d+\.\d+\.\d+)$'){
-        # очень грубо: если видим явный IP/подсеть и не RFC1918 — считаем публичным
-        if($dst -match '^\d{1,3}(\.\d{1,3}){3}$'){ $dstIsPublic = -not (_IsRFC1918 $dst) }
-      }
+      if($dst -match '^\d{1,3}(\.\d{1,3}){3}$'){ $dstIsPublic = -not (_IsRFC1918 $dst) }
 
       $hasPort = ($tail -match '\b(eq|lt|gt|range)\s+\d+')
       if($isAnyDst -and -not $hasPort){
-        [void]$egressWide.Add($ln)        # любой протокол, в любую сеть, без портов
+        [void]$egressWide.Add($ln)
       } elseif($isAnyDst -and $proto -match '^(?i)ip$'){
-        [void]$egressWide.Add($ln)        # ip any any
+        [void]$egressWide.Add($ln)
       } elseif($isAnyDst -and $proto -match '^(?i)tcp|udp$' -and -not $hasPort){
-        [void]$egressWide.Add($ln)        # tcp/udp any any без портов
+        [void]$egressWide.Add($ln)
       } elseif($isAnyDst -and $hasPort){
-        [void]$egressPortsWide.Add($ln)   # any, но с портами — всё ещё широко
+        [void]$egressPortsWide.Add($ln)
       } elseif($dstIsPublic -and -not $hasPort -and $proto -match '^(?i)ip|tcp|udp$'){
-        [void]$egressWide.Add($ln)        # явный публичный dst без портов
+        [void]$egressWide.Add($ln)
       }
     }
   }
 
-  # --- сборка отчёта и уровень риска ---
+  # --- вывод ---
   $ev = New-Object System.Collections.Generic.List[string]
   [void]$ev.Add('[NAT to outside]')
-  foreach($n in $toOutsideNat | Select-Object -First 30){ [void]$ev.Add($n) }
+  foreach($n in ($toOutsideNat | Select-Object -First 30)){ [void]$ev.Add($n) }
 
-  if($identityNat.Count -gt 0){ 
+  if($identityNat.Count -gt 0){
     [void]$ev.Add('[Identity NAT to outside]')
-    foreach($n in $identityNat | Select-Object -First 10){ [void]$ev.Add($n) }
+    foreach($n in ($identityNat | Select-Object -First 10)){ [void]$ev.Add($n) }
   }
   if($routeLookup.Count -gt 0){
     [void]$ev.Add('[route-lookup present]')
-    foreach($n in $routeLookup | Select-Object -First 10){ [void]$ev.Add($n) }
+    foreach($n in ($routeLookup | Select-Object -First 10)){ [void]$ev.Add($n) }
   }
   if($policyNat.Count -gt 0){
     [void]$ev.Add('[Policy NAT (destination match)]')
-    foreach($n in $policyNat | Select-Object -First 10){ [void]$ev.Add($n) }
+    foreach($n in ($policyNat | Select-Object -First 10)){ [void]$ev.Add($n) }
   }
 
   $sev = 'Medium'
@@ -1490,12 +1485,12 @@ function Check-ServerEgressNAT {
 
   if($egressWide.Count -gt 0){
     [void]$ev.Add('[ACL allowing NATed servers -> ANY (wide)]')
-    foreach($a in $egressWide | Select-Object -First 20){ [void]$ev.Add($a) }
+    foreach($a in ($egressWide | Select-Object -First 20)){ [void]$ev.Add($a) }
     $sev = 'High'
   }
   if($egressPortsWide.Count -gt 0){
     [void]$ev.Add('[ACL allowing NATed servers -> ANY (ports limited)]')
-    foreach($a in $egressPortsWide | Select-Object -First 20){ [void]$ev.Add($a) }
+    foreach($a in ($egressPortsWide | Select-Object -First 20)){ [void]$ev.Add($a) }
     if($sev -ne 'High'){ $sev = 'Medium' }
   }
   if($identityNat.Count -gt 0 -and $sev -ne 'High'){
