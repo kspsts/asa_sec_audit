@@ -1,16 +1,256 @@
 # ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
-# Version: 0.5.2
+# Version: 0.5.3
 
 [CmdletBinding()]
 param(
   [string]$Path = "asa_config.txt",
   [switch]$All,
   [string[]]$Checks,
+  [switch]$Html,
   [string]$OutJson = "asa_audit_report.json",
-  [switch]$Chart
+  [switch]$Chart,
+  [string]$HtmlPath = 'asa_audit_report.html',
+  [ValidateSet('ru','en')][string]$Lang = 'ru'
 )
 
 # ===================== Utils =====================
+
+# --- Localization (RU) ---
+$SeverityRu = @{
+  'High'   = 'Высокая'
+  'Medium' = 'Средняя'
+  'Low'    = 'Низкая'
+  'Info'   = 'Инфо'
+}
+
+# Карта переводов по ID проверки (дополни при желании)
+$FindingRu = @{
+  'ACL-ANY-ANY' = @{
+    Issue = 'Обнаружено правило "permit ip any any"'
+    Rec   = 'Удалите any-any; ограничьте сети/порты.'
+  }
+  'ACL-REDUNDANCY' = @{
+    Issue = 'Избыточные/затенённые/неиспользуемые ACL'
+    Rec   = 'Уточните порядок: сначала конкретные, затем широкие; уберите any-any.'
+  }
+  'MGMT-SSH' = @{
+    Issue = 'SSH разрешён слишком широко или не ограничен'
+    Rec   = 'Разрешите доступ только с доверенных подсетей; используйте только SSHv2.'
+  }
+  'MGMT-TELNET' = @{
+    Issue = 'Telnet включён'
+    Rec   = 'Отключите telnet; используйте SSHv2.'
+  }
+  'MGMT-HTTP' = @{
+    Issue = 'ASDM/HTTP доступен из широких подсетей'
+    Rec   = 'Ограничьте http-доступ или отключите, если не нужен.'
+  }
+  'SNMP' = @{
+    Issue = 'Слабая конфигурация SNMP/community'
+    Rec   = 'Смените community; ограничьте менеджеры; по возможности переходите на SNMPv3.'
+  }
+  'SNMP-V3' = @{
+    Issue = 'SNMPv3 не настроен (используется v2c)'
+    Rec   = 'Переходите на SNMPv3 (auth+priv), v2c — временно и под ACL.'
+  }
+  'CRYPTO-WEAK' = @{
+    Issue = 'Слабые/устаревшие криптонастройки (IKE/SSH/SA)'
+    Rec   = 'IKEv2 + AES-GCM/SHA-256/DH≥14; RSA ≥2048; исключить DES/3DES/MD5/SHA1.'
+  }
+  'WEBVPN-CIPHERS' = @{
+    Issue = 'Слабые шифросuites/версии SSL/TLS для AnyConnect/WebVPN'
+    Rec   = 'Разрешите только TLS1.2/1.3 с AES-GCM; запретите RC4/SHA1/TLS1.0.'
+  }
+  'IPSEC-TS-WEAK' = @{
+    Issue = 'Слабые IPsec transform-set (3DES/SHA1/MD5)'
+    Rec   = 'Замените на AES-(GCM или CBC-256) и SHA-256 PRF.'
+  }
+  'AUTH-PLAIN' = @{
+    Issue = 'Пароли/enable в открытом виде или слабые локальные учётные записи'
+    Rec   = 'Используйте enable secret/шифрование; предпочтительно AAA.'
+  }
+  'AAA-AUTH' = @{
+    Issue = 'AAA не настроен'
+    Rec   = 'Включите TACACS+/RADIUS; оставьте LOCAL как fallback.'
+  }
+  'AAA-USAGE' = @{
+    Issue = 'TACACS определён, но не используется'
+    Rec   = 'Переключите aaa authentication на TACACS с LOCAL fallback.'
+  }
+  'AAA-RESILIENCE' = @{
+    Issue = 'Слабые локальные fallback-учётки при наличии TACACS'
+    Rec   = 'Отключите лишние/слабые локальные учётки или зашифруйте их.'
+  }
+  'ICMP' = @{
+    Issue = 'ICMP разрешён слишком широко'
+    Rec   = 'Ограничьте ICMP только необходимыми источниками.'
+  }
+  'THREAT-DET' = @{
+    Issue = 'Threat-detection отключён или не в полном объёме'
+    Rec   = 'Включите basic-threat и статистические подсекции, если требуется.'
+  }
+  'NAT-WIDE' = @{
+    Issue = 'Широкий NAT (any→any)'
+    Rec   = 'Уточните объекты NAT; избегайте any→any.'
+  }
+  'SRV-ACL' = @{
+    Issue = 'Серверы доступны/инициируют широкие соединения'
+    Rec   = 'Ограничьте источники/направление; используйте только нужные подсети/порты.'
+  }
+  'SRV-NAT' = @{
+    Issue = 'Исход серверов через NAT к outside (возможно, широко)'
+    Rec   = 'Сузьте egress ACL/порты; избегайте повального PAT+permit any.'
+  }
+  'DMZ-INSIDE' = @{
+    Issue = 'Доступ DMZ → inside обнаружен'
+    Rec   = 'Минимизируйте доступ; конкретные хосты/порты; по возможности через прокси.'
+  }
+  'DMZ-ACL-BIND' = @{
+    Issue = 'На DMZ-подобных интерфейсах нет привязанной ACL'
+    Rec   = 'Привяжите ACL (access-group <ACL> in interface <nameif>).'
+  }
+  'LOGGING' = @{
+    Issue = 'Логирование отключено или минимальное'
+    Rec   = 'Включите logging enable/host; trap на соответствующий уровень.'
+  }
+  'LOGGING-DENY' = @{
+    Issue = 'Логирование deny на базе не настроено'
+    Rec   = 'Убедитесь, что события deny фиксируются (syslog) для расследований.'
+  }
+  'AC-PROTO' = @{
+    Issue = 'Устаревшие протоколы AnyConnect'
+    Rec   = 'Отключите sslv2/dtlsv1.0; используйте tls1.2/1.3.'
+  }
+  'AC-CIPHERS' = @{
+    Issue = 'Слабые шифры AnyConnect/SSL'
+    Rec   = 'Разрешите только современные шифросuites с AES-GCM.'
+  }
+}
+
+function Export-AsaReportHtml {
+  param(
+    [Parameter(Mandatory=$true)] [object[]]$Findings,
+    [string]$Path = 'asa_audit_report.html',
+    [string]$Lang = 'ru'
+  )
+
+  # для HtmlEncode
+  Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue
+
+  $items = if($Lang -eq 'ru'){ $Findings | ForEach-Object { Translate-FindingRu $_ } } else { $Findings }
+
+  $order = @('High','Medium','Low','Info')
+  $grouped = foreach($sev in $order){
+    [PSCustomObject]@{
+      Sev   = $sev
+      Title = if($Lang -eq 'ru'){ $SeverityRu[$sev] } else { $sev }
+      Items = @($items | Where-Object { $_.Severity -eq $sev })   # <== используем $sev
+    }
+  }
+
+  $counts = @{
+    High   = @($items | Where-Object Severity -eq 'High').Count
+    Medium = @($items | Where-Object Severity -eq 'Medium').Count
+    Low    = @($items | Where-Object Severity -eq 'Low').Count
+    Info   = @($items | Where-Object Severity -eq 'Info').Count
+  }
+
+  $style = @"
+<!doctype html>
+<html lang='ru'>
+<head>
+<meta charset='utf-8'/>
+<title>ASA Audit Report</title>
+<meta name='viewport' content='width=device-width, initial-scale=1'/>
+<style>
+  body{font-family:Segoe UI,Roboto,Arial,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:24px}
+  .wrap{max-width:1100px;margin:0 auto}
+  h1{font-size:24px;margin:0 0 8px}
+  .muted{color:#94a3b8}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0 24px}
+  .card{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:16px}
+  .k{font-size:14px;color:#94a3b8}
+  .v{font-size:28px;font-weight:700}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;margin-right:8px}
+  .High {background:#7f1d1d;color:#fecaca}
+  .Medium{background:#78350f;color:#fde68a}
+  .Low{background:#064e3b;color:#bbf7d0}
+  .Info{background:#0c4a6e;color:#bae6fd}
+  .issue{font-size:16px;margin:8px 0 4px}
+  .id{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;color:#9ca3af;font-size:12px}
+  .ev{white-space:pre-wrap;background:#0a0f1c;border:1px dashed #1f2937;border-radius:8px;padding:10px;margin-top:8px;color:#cbd5e1}
+  .rec{margin-top:8px;color:#e5e7eb}
+  .sec{margin:18px 0}
+  .sec h2{margin:0 0 8px;font-size:20px}
+  .hr{height:1px;background:#1f2937;margin:18px 0}
+  .footer{margin:24px 0;color:#94a3b8;font-size:12px}
+</style>
+</head>
+<body><div class='wrap'>
+"@
+
+  $header = @"
+<h1>ASA Audit Report</h1>
+<div class='muted'>Сгенерировано: $(Get-Date -Format 'yyyy-MM-dd HH:mm')</div>
+<div class='grid'>
+  <div class='card'><div class='k'>Высокая</div><div class='v'>$($counts.High)</div></div>
+  <div class='card'><div class='k'>Средняя</div><div class='v'>$($counts.Medium)</div></div>
+  <div class='card'><div class='k'>Низкая</div><div class='v'>$($counts.Low)</div></div>
+  <div class='card'><div class='k'>Инфо</div><div class='v'>$($counts.Info)</div></div>
+</div>
+<div class='hr'></div>
+"@
+
+  $sb = New-Object System.Text.StringBuilder
+  [void]$sb.Append($style)
+  [void]$sb.Append($header)
+
+  foreach($g in $grouped){
+    if($g.Items.Count -eq 0){ continue }
+    [void]$sb.Append("<div class='sec'><h2><span class='badge $($g.Sev)'>$($g.Title)</span></h2>")
+    foreach($f in $g.Items){
+      $title = if($Lang -eq 'ru'){ $f.IssueRu } else { $f.Description }
+      $rec   = if($Lang -eq 'ru'){ $f.RecRu } else { $f.Recommendation }
+      $evTxt = if($f.Evidence){ ($f.Evidence -join "`n") } else { '' }
+
+      [void]$sb.Append("<div class='issue'>$title</div>")
+      [void]$sb.Append("<div class='id'>$($f.Id)</div>")
+      if($evTxt){ [void]$sb.Append("<div class='ev'>$( [System.Web.HttpUtility]::HtmlEncode($evTxt) )</div>") }
+      if($rec){ [void]$sb.Append("<div class='rec'><b>Рекомендация:</b> $rec</div>") }
+      [void]$sb.Append("<div class='hr'></div>")
+    }
+    [void]$sb.Append("</div>")
+  }
+
+  [void]$sb.Append("<div class='footer'>© ASA Audit. Отчёт создан скриптом PowerShell.</div></div></body></html>")
+  Set-Content -Path $Path -Value $sb.ToString() -Encoding UTF8
+  Write-Host "HTML отчёт сохранён: $Path" -ForegroundColor Cyan
+}
+
+function Translate-FindingRu {
+  param([pscustomobject]$F)
+
+  $id  = $F.Id
+  $sev = $F.Severity
+  $ru  = if($FindingRu.ContainsKey($id)) { $FindingRu[$id] } else { $null }
+
+  $issue = if($ru -and $ru.Issue){ $ru.Issue } else { $F.Title }         # <== было $F.Description
+  $rec   = if($ru -and $ru.Rec){   $ru.Rec   } else { $F.Recommendation }
+
+  [PSCustomObject]@{
+    Id             = $id
+    Severity       = $sev
+    SeverityRu     = ($SeverityRu[$sev] | ForEach-Object { $_ })
+    Title          = $F.Title
+    IssueRu        = $issue
+    Ok             = $F.Passed
+    Evidence       = $F.Evidence
+    Recommendation = $F.Recommendation
+    RecRu          = $rec
+    BoundInfo      = $F.BoundInfo
+  }
+}
+
 
 function Read-AsaConfig {
   param([string]$Path)
@@ -50,8 +290,14 @@ function Get-IndexLines {
 }
 
 function Write-AsaReport {
-  param([PSCustomObject[]]$Findings,[string]$OutJson,[switch]$Chart)
+  param(
+    [PSCustomObject[]]$Findings,
+    [string]$OutJson,
+    [switch]$Chart
+  )
+
   $sorted = $Findings | Sort-Object @{Expression='Passed';Descending=$true}, @{Expression='Severity';Descending=$true}, 'Id'
+
   foreach($f in $sorted){
     $state = if($f.Passed){ '[OK]' } else { '[ISSUE]' }
     $color = if($f.Passed){ 'Green' } elseif($f.Severity -eq 'High'){'Red'} elseif($f.Severity -eq 'Medium'){'Yellow'} else {'Cyan'}
@@ -60,15 +306,20 @@ function Write-AsaReport {
     if(-not $f.Passed -and $f.Recommendation){ Write-Host "  Recommendation: $($f.Recommendation)" -ForegroundColor Magenta }
     Write-Host
   }
+
   $sorted | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 $OutJson
   Write-Host "JSON report saved: $OutJson" -ForegroundColor Cyan
 
   if($Chart){
     $bySev = $Findings | Group-Object Severity | Sort-Object Name
     Write-Host "Severity histogram:" -ForegroundColor Cyan
-    foreach($g in $bySev){ $bar = ('#' * $g.Count); Write-Host ("{0,-6} {1,3} | {2}" -f $g.Name,$g.Count,$bar) }
+    foreach($g in $bySev){
+      $bar = ('#' * $g.Count)
+      Write-Host ("{0,-6} {1,3} | {2}" -f $g.Name,$g.Count,$bar)
+    }
   }
 }
+
 
 # ============ Parsing: objects / groups ============
 
@@ -1621,9 +1872,8 @@ try {
     $fn = $CheckMap[$name]
     $findings += & $fn $cfg $obj
   }
-
   Write-AsaReport -Findings $findings -OutJson $OutJson -Chart:$Chart
-}
-catch {
-  Write-Error "Audit error: $_"
+
+  if($Html){
+    Export-AsaReportHtml -Findings $findings -Path $HtmlPath -Lang $Lang
 }
