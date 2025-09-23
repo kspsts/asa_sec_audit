@@ -1,5 +1,5 @@
 # ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
-# Version: 0.4.8
+# Version: 0.4.9
 
 [CmdletBinding()]
 param(
@@ -1167,7 +1167,7 @@ function Check-DMZtoInsideDeep {
     continue
   }
 
-  # --- локальные utils ---
+  # --- локальные utils (самодостаточно) ---
   function __NewSet { [System.Collections.Generic.HashSet[string]]::new() }
   function __Enum($x) { if($null -eq $x){ @() } elseif($x -is [System.Array]){ @($x) } else { @($x) } }
   function __Keys($h) { if($h -and $h.PSObject.Properties['Keys']){ @($h.Keys) } else { @() } }
@@ -1195,57 +1195,54 @@ function Check-DMZtoInsideDeep {
     $map
   }
 
+  # --- вход ---
   $lines = __Enum($Cfg?.Lines)
   if($lines.Count -eq 0){
     return New-Finding 'DMZ-INSIDE' 'No lines to analyze' 'Info' $true
   }
 
-  # --- nameif извлечение ---
-  $nameifs=@{}  # phys_if -> nameif
+  # --- nameif + security-level извлечение ---
+  $ifMeta = @()   # [{Nameif='dmz'; Sec=0}, ...]
+  $nameifs=@{}    # phys_if -> nameif
   for($i=0;$i -lt $lines.Count;$i++){
     if($lines[$i] -match '^\s*interface\s+(\S+)'){
-      $cur=$matches[1]
+      $phys=$matches[1]; $curName=$null; $curSec=$null
       for($j=$i+1;$j -lt $lines.Count -and $lines[$j] -match '^\s+';$j++){
-        if($lines[$j] -match '^\s*nameif\s+(\S+)'){ $nameifs[$cur]=$matches[1]; break }
+        if($lines[$j] -match '^\s*nameif\s+(\S+)'){ $curName=$matches[1]; $nameifs[$phys]=$curName }
+        elseif($lines[$j] -match '^\s*security-level\s+(\d+)\b'){ $curSec=[int]$matches[1] }
       }
+      if($curName){ $ifMeta += [pscustomobject]@{ Nameif=$curName; Sec=$curSec } }
     }
   }
 
+  # --- кандидаты интерфейсов DMZ/INSIDE ---
   $dmzIfSet = __NewSet
-  foreach($n in __Enum($nameifs.Values)){ if($n -match '^(?i)(dmz|guest|partner)$'){ [void]$dmzIfSet.Add($n) } }
+  foreach($n in __Enum($nameifs.Values)){ if($n -match '^(?i)(dmz|guest|partner|online|public)$'){ [void]$dmzIfSet.Add($n) } }
+  foreach($m in $ifMeta){ if($m.Sec -ge 1 -and $m.Sec -le 99 -and $m.Nameif){ [void]$dmzIfSet.Add($m.Nameif) } }
   if($dmzIfSet.Count -eq 0){ [void]$dmzIfSet.Add('dmz') } # эвристика
 
   $insideIfSet = __NewSet
   foreach($n in __Enum($nameifs.Values)){ if($n -match '^(?i)(inside|internal|corp|intranet|lan|pci)$'){ [void]$insideIfSet.Add($n) } }
   if($insideIfSet.Count -eq 0){ [void]$insideIfSet.Add('inside') } # эвристика
 
-  # --- наборы имён из объектов/групп ---
-  $dmzNameSet    = __NewSet
-  $insideNameSet = __NewSet
-
-  if($Obj){
-    foreach($k in __Keys($Obj.ObjectHosts)){
-      if($k -match '(?i)\b(dmz|guest|partner)\b'){ [void]$dmzNameSet.Add($k) }
-      if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ [void]$insideNameSet.Add($k) }
-    }
-    foreach($k in __Keys($Obj.ObjectSubnets)){
-      if($k -match '(?i)\b(dmz|guest|partner)\b'){ [void]$dmzNameSet.Add($k) }
-      if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ [void]$insideNameSet.Add($k) }
-    }
-    foreach($k in __Keys($Obj.GroupHosts)){
-      if($k -match '(?i)\b(dmz|guest|partner)\b'){ [void]$dmzNameSet.Add($k) }
-      if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ [void]$insideNameSet.Add($k) }
-    }
-    foreach($k in __Keys($Obj.GroupSubnets)){
-      if($k -match '(?i)\b(dmz|guest|partner)\b'){ [void]$dmzNameSet.Add($k) }
-      if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ [void]$insideNameSet.Add($k) }
-    }
-  }
-
-  # --- привязки ACL ---
+  # --- карта привязок ACL ---
   $bindMap = __BindMap $Cfg
 
-  # --- ACL ---
+  # Если на DMZ-подобных интерфейсах нет привязанных ACL — отдельное замечание
+  $dmzBound = @()
+  foreach($acl in __GetIndexLines $Cfg 'access-group'){
+    if($acl -match '^\s*access-group\s+(\S+)\s+(in|out)\s+interface\s+(\S+)'){
+      $iface=$matches[3]
+      if($dmzIfSet.Contains($iface)){ $dmzBound += $acl }
+    }
+  }
+  if($dmzIfSet.Count -gt 0 -and $dmzBound.Count -eq 0){
+    $meta = if($ifMeta){ ($ifMeta | ForEach-Object { "$($_.Nameif) sec $($_.Sec)" }) } else { @() }
+    return New-Finding 'DMZ-ACL-BIND' 'No ACL bound to DMZ-like interfaces' 'Info' $false $meta `
+      'Bind an access-list to DMZ/online interfaces (access-group <ACL> in interface <nameif>).'
+  }
+
+  # --- ACL строки ---
   $aclLines = __GetIndexLines $Cfg 'access-list'
   if($aclLines.Count -eq 0){
     return New-Finding 'DMZ-INSIDE' 'No ACLs found for DMZ->inside analysis' 'Info' $true
@@ -1255,14 +1252,14 @@ function Check-DMZtoInsideDeep {
   $evBroad  = New-Object System.Collections.Generic.List[string]  # DMZ -> ANY
   $evHints  = New-Object System.Collections.Generic.List[string]  # широкие подсети в группах
 
-  # широкие подсети в группах
+  # --- широкие подсети в группах ---
   foreach($g in __Keys($Obj?.GroupSubnets)){
     foreach($sn in __Enum($Obj.GroupSubnets[$g])){
       $parts=$sn -split '\s+'
       if($parts.Count -ge 2){
         $mask=$parts[1]
         if($mask -eq '255.0.0.0' -or $mask -eq '255.255.0.0'){
-          if($g -match '(?i)dmz|guest|partner'){   [void]$evHints.Add("DMZ group $g includes broad subnet $sn") }
+          if($g -match '(?i)dmz|guest|partner'){ [void]$evHints.Add("DMZ group $g includes broad subnet $sn") }
           if($g -match '(?i)inside|internal|corp|intranet|lan|pci'){ [void]$evHints.Add("INSIDE group $g includes broad subnet $sn") }
         }
       }
@@ -1281,11 +1278,19 @@ function Check-DMZtoInsideDeep {
 
     # источник DMZ?
     $isDmzSrc =
-      (($p.SrcType -in @('object','og')) -and $p.Src -and $dmzNameSet.Contains($p.Src)) -or
+      (($p.SrcType -in @('object','og')) -and $p.Src -and $dmzIfSet.Any({ $p.Name -match ('(?i)^{0}$' -f [regex]::Escape($_)) }) -or $dmzNameSet.Contains($p.Src)) -or
       ($p.SrcType -eq 'subnet' -and $p.Src -match '^172\.(1[6-9]|2\d|3[01])\.' -and $p.Name -and $p.Name -match '(?i)dmz') -or
       ($p.SrcType -eq 'host'   -and $p.Name -and $p.Name -match '(?i)dmz')
 
     # назначение INSIDE?
+    if(-not (Get-Variable insideNameSet -Scope Local -ErrorAction SilentlyContinue)){
+      $insideNameSet = __NewSet
+      foreach($k in __Keys($Obj?.ObjectHosts)){ if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ $insideNameSet.Add($k) | Out-Null } }
+      foreach($k in __Keys($Obj?.ObjectSubnets)){ if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ $insideNameSet.Add($k) | Out-Null } }
+      foreach($k in __Keys($Obj?.GroupHosts)){ if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ $insideNameSet.Add($k) | Out-Null } }
+      foreach($k in __Keys($Obj?.GroupSubnets)){ if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ $insideNameSet.Add($k) | Out-Null } }
+    }
+
     $isInsideDst =
       (($p.DstType -in @('object','og')) -and $p.Dst -and $insideNameSet.Contains($p.Dst)) -or
       ($p.DstType -eq 'subnet' -and $p.Dst -and ($p.Dst -match '^\d{1,3}(?:\.\d{1,3}){3}\s+\d{1,3}(?:\.\d{1,3}){3}$' -and (__IsRFC1918 ($p.Dst -split '\s+')[0])) ) -or
@@ -1304,12 +1309,12 @@ function Check-DMZtoInsideDeep {
     return New-Finding 'DMZ-INSIDE' 'No DMZ->inside permits detected' 'Info' $true
   }
 
-  # оценка широты сервисов
+  # --- оценка широты сервисов ---
   function __IsWideService([string]$svc){
-    if([string]::IsNullOrWhiteSpace($svc)){ return $true }      # нет уточнения => широко
+    if([string]::IsNullOrWhiteSpace($svc)){ return $true }
     if($svc -match '^\s*ip\s*$'){ return $true }
     if($svc -match '\brange\s+\d+\s+\d+\b'){ return $true }
-    if($svc -match '\b(eq|lt|gt)\s+\d+\b'){ return $false }      # есть порт
+    if($svc -match '\b(eq|lt|gt)\s+\d+\b'){ return $false }
     return $false
   }
 
@@ -1326,17 +1331,20 @@ function Check-DMZtoInsideDeep {
     }
     if($sev -ne 'High' -and ($outsideIn -or $insideIn)){ $sev='High' }
   } elseif($evBroad.Count -gt 0){
-    $sev='High'  # DMZ -> ANY считаем высоким риском
+    $sev='High'
   }
 
-  # evidence
+  # --- evidence ---
   $evid = New-Object System.Collections.Generic.List[string]
   if($evStrict.Count -gt 0){ [void]$evid.Add('[DMZ -> INSIDE]'); foreach($x in __Enum($evStrict)){ [void]$evid.Add([string]$x) } }
   if($evBroad.Count  -gt 0){ [void]$evid.Add('[DMZ -> ANY]');    foreach($x in __Enum($evBroad)){  [void]$evid.Add([string]$x) } }
-  if($evHints.Count  -gt 0){ [void]$evid.Add('[GROUP CONTENT]'); foreach($x in __Enum($evHints)){  [void]$evid.Add([string]$x) } }
 
-  New-Finding 'DMZ-INSIDE' 'DMZ to inside access permitted (direction-aware)' $sev $false ($evid | Select-Object -Unique) `
-    'Minimize DMZ->inside access; keep least privilege, specific hosts/ports; prefer flow via proxies or outside.'
+  if($evid.Count -gt 0){
+    New-Finding 'DMZ-INSIDE' 'DMZ to inside access permitted (direction-aware)' $sev $false ($evid | Select-Object -Unique) `
+      'Minimize DMZ->inside access; keep least privilege, specific hosts/ports; prefer flow via proxies or outside.'
+  } else {
+    New-Finding 'DMZ-INSIDE' 'No DMZ->inside permits detected' 'Info' $true
+  }
 }
 
 # ===================== Registry =====================
