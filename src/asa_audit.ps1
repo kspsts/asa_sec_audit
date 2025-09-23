@@ -1,4 +1,5 @@
 # ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
+# Version: 0.2.1
 
 [CmdletBinding()]
 param(
@@ -187,12 +188,51 @@ function Is-SupersetRule {
 
 # ===================== Checks =====================
 
-function Check-ACLAnyAny { param($Cfg)
-  $hits = @()
-  if($Cfg.Index.Contains('access-list')){ $hits = $Cfg.Index['access-list'] | Where-Object { $_ -match '\bpermit\s+ip\s+any\s+any\b' } }
-  $sev = if(Get-OutsideAcls -Cfg $Cfg){ 'High' } else { 'Medium' }
-  if($hits){ New-Finding 'ACL-ANY-ANY' 'Permit ip any any present' $sev $false $hits 'Remove any-any; restrict to needed ports/networks.' }
-  else     { New-Finding 'ACL-ANY-ANY' 'Permit ip any any not found' 'Info' $true }
+function Check-ACLAnyAny {
+  param($Cfg)
+
+  $acls   = @(); if($Cfg.Index.Contains('access-list')){ $acls = $Cfg.Index['access-list'] }
+  $groups = @(); if($Cfg.Index.Contains('access-group')){ $groups = $Cfg.Index['access-group'] }
+
+  # Map: ACL Name -> list of {Direction, Interface|global}
+  $bindMap = @{}
+  foreach($g in $groups){
+    $m = [regex]::Match($g,'^\s*access-group\s+(?<name>\S+)\s+(?<dir>in|out)\s+(?:interface\s+(?<if>\S+)|global)\s*$', 'IgnoreCase')
+    if($m.Success){
+      $n = $m.Groups['name'].Value
+      if(-not $bindMap.ContainsKey($n)){ $bindMap[$n] = New-Object System.Collections.Generic.List[object] }
+      $ifc = if($m.Groups['if'].Success){ $m.Groups['if'].Value } else { 'global' }
+      [void]$bindMap[$n].Add([PSCustomObject]@{ Direction=$m.Groups['dir'].Value; Interface=$ifc })
+    }
+  }
+
+  $hits = @($acls | Where-Object { $_ -match '\bpermit\s+ip\s+any\s+any\b' })
+  if(-not $hits -or $hits.Count -eq 0){
+    return New-Finding 'ACL-ANY-ANY' 'Permit ip any any not found' 'Info' $true
+  }
+
+  $ev = New-Object System.Collections.Generic.List[string]
+  $outsideIn = $false
+  foreach($ln in $hits){
+    $m = [regex]::Match($ln,'^\s*access-list\s+(?<name>\S+)\s+', 'IgnoreCase')
+    $annot = $ln
+    if($m.Success){
+      $name = $m.Groups['name'].Value
+      if($bindMap.ContainsKey($name)){
+        $bindsTxt = ($bindMap[$name] | ForEach-Object { "[{0} {1}]" -f $_.Interface,$_.Direction }) -join ' '
+        $annot = "$ln  $bindsTxt"
+        if(($bindMap[$name] | Where-Object { $_.Interface -match '^outside$' -and $_.Direction -eq 'in' }).Count -gt 0){
+          $outsideIn = $true
+        }
+      } else {
+        $annot = "$ln  [UNBOUND]"
+      }
+    }
+    [void]$ev.Add($annot)
+  }
+
+  $sev = if($outsideIn){ 'High' } else { 'Medium' }
+  New-Finding 'ACL-ANY-ANY' 'Permit ip any any present' $sev $false ($ev | Select-Object -Unique) 'Remove any-any; restrict to needed ports/networks.'
 }
 
 function Check-DangerousServicesAnyAny {
@@ -260,13 +300,17 @@ function Check-ACLRedundancy {
   $acls = @()
   if($Cfg.Index.Contains('access-list')){ $acls = $Cfg.Index['access-list'] }
   if($acls.Count -eq 0){ return New-Finding 'ACL-REDUNDANCY' 'No ACLs found' 'Info' $true }
+
   $map = @{}
   foreach($ln in $acls){
     $p = Parse-AclLine -Line $ln
     if($p){ if(-not $map.ContainsKey($p.Name)){ $map[$p.Name] = [System.Collections.Generic.List[object]]::new() }; $map[$p.Name].Add($p) }
   }
+
   $duplicates = [System.Collections.Generic.List[string]]::new()
   $shadowed   = [System.Collections.Generic.List[string]]::new()
+  $anyAnyAfter= [System.Collections.Generic.List[string]]::new()
+
   $boundNames = @()
   if($Cfg.Index.Contains('access-group')){
     foreach($ag in $Cfg.Index['access-group']){
@@ -275,9 +319,20 @@ function Check-ACLRedundancy {
   }
   $boundNames = $boundNames | Select-Object -Unique
   $unbound = ($map.Keys | Where-Object { $boundNames -notcontains $_ })
+
   foreach($name in $map.Keys){
     $seen = [System.Collections.Generic.HashSet[string]]::new()
     $rules = $map[$name]
+
+    # any-any not last
+    for($i=0;$i -lt $rules.Count; $i++){
+      if($rules[$i].Action -eq 'permit' -and $rules[$i].Proto -eq 'ip' -and
+         $rules[$i].SrcType -eq 'any' -and $rules[$i].DstType -eq 'any' -and
+         $i -lt ($rules.Count-1)){
+        $anyAnyAfter.Add("[$name] ANY-ANY not last: " + $rules[$i].Raw.Trim())
+      }
+    }
+
     for($i=0;$i -lt $rules.Count;$i++){
       $raw = ($rules[$i].Raw -replace '\s+',' ').Trim()
       if($seen.Contains($raw)){ $duplicates.Add("[$name] DUP: $raw"); continue } else { [void]$seen.Add($raw) }
@@ -288,15 +343,18 @@ function Check-ACLRedundancy {
       }
     }
   }
-  if($duplicates.Count -or $shadowed.Count -or $unbound.Count){
+
+  if($duplicates.Count -or $shadowed.Count -or $unbound.Count -or $anyAnyAfter.Count){
     $evid = @()
     if($duplicates.Count){ $evid += ($duplicates | Select-Object -First 10) }
     if($shadowed.Count){   $evid += ($shadowed   | Select-Object -First 10) }
     if($unbound){          $evid += ($unbound    | ForEach-Object { "[UNBOUND] $_" } | Select-Object -First 10) }
+    if($anyAnyAfter.Count){$evid += ($anyAnyAfter| Select-Object -First 10) }
     $rec = @()
     if($duplicates.Count){ $rec += 'Remove exact duplicate ACL lines.' }
     if($shadowed.Count){   $rec += 'Reorder: specific rules first, wide rules later; avoid any-any.' }
     if($unbound){          $rec += 'Remove or bind unused ACLs via access-group.' }
+    if($anyAnyAfter.Count){$rec += 'Place "permit ip any any" strictly at the end of each ACL (if needed).' }
     New-Finding 'ACL-REDUNDANCY' 'Redundant/shadowed/unused ACLs detected' 'Medium' $false $evid ($rec -join ' ')
   } else {
     New-Finding 'ACL-REDUNDANCY' 'No redundancy detected (heuristic)' 'Info' $true
