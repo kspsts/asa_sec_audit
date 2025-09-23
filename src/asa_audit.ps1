@@ -1,5 +1,5 @@
 # ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
-# Version: 0.2.5
+# Version: 0.3.1
 
 [CmdletBinding()]
 param(
@@ -998,6 +998,162 @@ function Check-AnyConnectProfileCipher {
   }
 }
 
+function Check-CertTrustpoint {
+  param($Cfg)
+
+  $bind = $Cfg.Lines | Where-Object { $_ -match '^\s*ssl\s+trust-point\s+\S+\s+\S+\s*$' }
+  $tpBlocks = @()
+  # собрать имена trustpoint
+  $tpNames = @()
+  foreach($b in $bind){ if($b -match 'ssl\s+trust-point\s+(\S+)\s+(\S+)'){ $tpNames += $matches[1] } }
+  $tpNames = $tpNames | Select-Object -Unique
+
+  # эвристика self-signed: enrollment self / DefaultASA
+  $selfHints = New-Object System.Collections.Generic.List[string]
+  for($i=0;$i -lt $Cfg.Lines.Count; $i++){
+    if($Cfg.Lines[$i] -match '^\s*crypto\s+ca\s+trustpoint\s+(\S+)'){
+      $name = $matches[1]
+      $blk = @($Cfg.Lines[$i])
+      for($j=$i+1; $j -lt $Cfg.Lines.Count -and $Cfg.Lines[$j] -match '^\s+'; $j++){ $blk += $Cfg.Lines[$j] }
+      $i = $j-1
+      if($tpNames -contains $name){
+        foreach($l in $blk){
+          if($l -match '\benrollment\s+self\b' -or $l -match 'subject-name\s+.*DefaultASA'){
+            [void]$selfHints.Add("trustpoint $name : " + $l.Trim())
+          }
+        }
+      }
+    }
+  }
+
+  if(-not $bind -or $bind.Count -eq 0){
+    return New-Finding 'CERT-TP' 'No ssl trust-point bound to interface(s)' 'Medium' $false @() 'Bind proper CA-issued trustpoint per interface: ssl trust-point <tp> <iface>.'
+  }
+
+  if($selfHints.Count -gt 0){
+    return New-Finding 'CERT-TP' 'Self-signed/placeholder trustpoint in use (heuristic)' 'Medium' $false ($bind + ($selfHints | Select-Object -Unique)) 'Use CA-issued cert; avoid self-signed in production.'
+  }
+
+  New-Finding 'CERT-TP' 'Trustpoint bound (no obvious self-signed hints)' 'Info' $true $bind
+}
+
+function Check-AAA-Accounting {
+  param($Cfg)
+
+  $aaaSrvTac = $Cfg.Lines | Where-Object { $_ -match '^\s*aaa-server\s+\S+\s+protocol\s+tacacs\+' }
+  $authCfg   = $Cfg.Lines | Where-Object { $_ -match '^\s*aaa\s+authentication\s+(ssh|enable)\s+console\s+\S+' }
+  $acct      = $Cfg.Lines | Where-Object { $_ -match '^\s*aaa\s+accounting\s+(command|connection|system)\s+\S+' }
+  $authorCmd = $Cfg.Lines | Where-Object { $_ -match '^\s*aaa\s+authorization\s+command\s+\S+' }
+
+  if($aaaSrvTac -and $authCfg -and (-not $acct)){
+    return New-Finding 'AAA-ACCT' 'AAA accounting not configured' 'Medium' $false ($authCfg | Select-Object -First 3) 'Enable TACACS accounting (commands/system).'
+  }
+  if($aaaSrvTac -and (-not $authorCmd)){
+    return New-Finding 'AAA-AUTHZ' 'AAA authorization for commands not configured' 'Medium' $false ($aaaSrvTac | Select-Object -First 3) 'Enable aaa authorization command (TACACS+).'
+  }
+  New-Finding 'AAA-ACCT' 'AAA accounting/authorization posture OK (heuristic)' 'Info' $true
+}
+
+function Check-NTP {
+  param($Cfg)
+  $ntp = $Cfg.Lines | Where-Object { $_ -match '^\s*ntp\s+server\s+\S+' }
+  if(-not $ntp -or $ntp.Count -eq 0){
+    return New-Finding 'NTP' 'No NTP servers configured' 'Low' $false @() 'Configure NTP for accurate logs/certs.'
+  }
+  New-Finding 'NTP' 'NTP servers present' 'Info' $true $ntp
+}
+
+function Check-VPNFilterDAP {
+  param($Cfg)
+
+  # наличие remote-access (webvpn или tunnel-group типа remote-access)
+  $hasWebvpn = ($Cfg.Lines | Where-Object { $_ -match '^\s*webvpn\b' })
+  $hasRA     = ($Cfg.Lines | Where-Object { $_ -match '^\s*tunnel-group\s+\S+\s+type\s+remote-access\b' })
+
+  if(-not $hasWebvpn -and -not $hasRA){
+    return New-Finding 'AC-VPN-FILTER' 'Remote access VPN not detected (heuristic)' 'Info' $true
+  }
+
+  # ищем vpn-filter и/или DAP
+  $gpVpnFilter = $Cfg.Lines | Where-Object { $_ -match '^\s*group-policy\s+\S+\s+(internal|attributes)\b' -or $_ -match '^\s*vpn-filter\s+value\s+\S+' -or $_ -match '^\s*vpn-filter\s+\S+' }
+  $vpnFilterAny = $Cfg.Lines | Where-Object { $_ -match '^\s*vpn-filter\s+(\S+|\s*value\s+\S+)\b' }
+  $dap = $Cfg.Lines | Where-Object { $_ -match '^\s*dynamic-access-policy-record\b' }
+
+  if((-not $vpnFilterAny -or $vpnFilterAny.Count -eq 0) -and (-not $dap -or $dap.Count -eq 0)){
+    return New-Finding 'AC-VPN-FILTER' 'AnyConnect without vpn-filter/DAP' 'Medium' $false ($hasWebvpn | Select-Object -First 2) 'Apply vpn-filter per group-policy or use DAP to restrict user traffic.'
+  }
+
+  $ev = @()
+  if($vpnFilterAny){ $ev += ($vpnFilterAny | Select-Object -First 5) }
+  if($dap){ $ev += ($dap | Select-Object -First 5) }
+  New-Finding 'AC-VPN-FILTER' 'AnyConnect access controls present (vpn-filter/DAP)' 'Info' $true $ev
+}
+
+function Check-ACLTimeRange {
+  param($Cfg)
+  $hits = $Cfg.Lines | Where-Object { $_ -match '^\s*access-list\s+\S+\s+\S+\s+.*\btime-range\s+\S+\b' }
+  if($hits){
+    New-Finding 'ACL-TIMERANGE' 'ACL entries with time-range (review schedules)' 'Info' $true ($hits | Select-Object -First 10)
+  } else {
+    New-Finding 'ACL-TIMERANGE' 'No ACL time-range entries found' 'Info' $true
+  }
+}
+
+function Check-ProxyARP {
+  param($Cfg)
+  $noProxy = $Cfg.Lines | Where-Object { $_ -match '^\s*sysopt\s+noproxyarp(\s+\S+)?\s*$' }
+  if($noProxy -and $noProxy.Count -gt 0){
+    return New-Finding 'PROXY-ARP' 'Proxy ARP disabled (sysopt noproxyarp)' 'Info' $true $noProxy
+  } else {
+    # подсказка сильнее, если есть статические/identity NAT
+    $natStatic = $Cfg.Lines | Where-Object { $_ -match '^\s*static\s+\(' -or $_ -match '^\s*nat\s*\(\S+,\S+\)\s+source\s+static\b' }
+    $sev = if($natStatic){ 'Medium' } else { 'Low' }
+    return New-Finding 'PROXY-ARP' 'Proxy ARP may be enabled (verify per interface)' $sev $false ($natStatic | Select-Object -First 3) 'Consider sysopt noproxyarp to avoid ARP exposure for NATs.'
+  }
+}
+
+function Check-FailoverHygiene {
+  param($Cfg)
+
+  $fo = $Cfg.Lines | Where-Object { $_ -match '^\s*failover\b' }
+  if(-not $fo){ return New-Finding 'FAILOVER' 'Failover not configured' 'Info' $true }
+
+  $key   = $Cfg.Lines | Where-Object { $_ -match '^\s*failover\s+key(\s+hex)?\s+\S+' }
+  $monif = $Cfg.Lines | Where-Object { $_ -match '^\s*monitor-interface\s+\S+' }
+  $link  = $Cfg.Lines | Where-Object { $_ -match '^\s*failover\s+link\s+\S+\s+\S+' -or $_ -match '^\s*failover\s+interface-ip\s+\S+\s+' }
+
+  $miss = @()
+  if(-not $key){  $miss += 'failover key' }
+  if(-not $monif){$miss += 'monitor-interface' }
+  if(-not $link){ $miss += 'failover link/interface-ip' }
+
+  if($miss.Count -gt 0){
+    New-Finding 'FAILOVER' ('Failover configured but missing: ' + ($miss -join ', ')) 'Medium' $false (($fo | Select-Object -First 3) + ($key+$monif+$link)) 'Set failover key, monitor-interface, link/interface-ip.'
+  } else {
+    New-Finding 'FAILOVER' 'Failover configured (key/monitor/link present)' 'Info' $true ($key+$monif+$link)
+  }
+}
+
+function Check-SameSecurity {
+  param($Cfg)
+  $same = $Cfg.Lines | Where-Object { $_ -match '^\s*same-security-traffic\s+permit\s+(intra-interface|inter-interface)\b' }
+  if($same){
+    New-Finding 'SAME-SEC' 'same-security-traffic permit enabled' 'Low' $false $same 'Keep only if required; review hairpin/inter-zone flows.'
+  } else {
+    New-Finding 'SAME-SEC' 'same-security-traffic not enabled' 'Info' $true
+  }
+}
+
+function Check-ManagementAccess {
+  param($Cfg)
+  $mg = $Cfg.Lines | Where-Object { $_ -match '^\s*management-access\s+\S+\b' }
+  if($mg){
+    New-Finding 'MGMT-ACCESS' 'management-access enabled' 'Low' $false $mg 'Use only if needed (VPN mgmt through inside).'
+  } else {
+    New-Finding 'MGMT-ACCESS' 'management-access not set' 'Info' $true
+  }
+}
+
 # ===================== Registry =====================
 
 $CheckMap = [ordered]@{
@@ -1058,6 +1214,16 @@ $CheckMap = [ordered]@{
   WebvpnTimeouts            = { param($cfg,$obj) Check-WebvpnTimeouts         -Cfg $cfg }
   LoggingDTLS               = { param($cfg,$obj) Check-LoggingDTLS            -Cfg $cfg }
   ACProfileCipher           = { param($cfg,$obj) Check-AnyConnectProfileCipher -Cfg $cfg }
+
+  CertTrustpoint             = { param($cfg,$obj) Check-CertTrustpoint     -Cfg $cfg }
+  AAAAccounting              = { param($cfg,$obj) Check-AAA-Accounting     -Cfg $cfg }
+  NTP                        = { param($cfg,$obj) Check-NTP                 -Cfg $cfg }
+  VPNFilterDAP               = { param($cfg,$obj) Check-VPNFilterDAP        -Cfg $cfg }
+  ACLTimeRange               = { param($cfg,$obj) Check-ACLTimeRange        -Cfg $cfg }
+  ProxyARP                   = { param($cfg,$obj) Check-ProxyARP            -Cfg $cfg }
+  FailoverHygiene            = { param($cfg,$obj) Check-FailoverHygiene     -Cfg $cfg }
+  SameSecurity               = { param($cfg,$obj) Check-SameSecurity        -Cfg $cfg }
+  ManagementAccess           = { param($cfg,$obj) Check-ManagementAccess    -Cfg $cfg }
 }
 
 # ===================== Menu =====================
