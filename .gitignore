@@ -1,0 +1,19 @@
+
+# PowerShell
+*.psd1
+*.psm1
+*.nupkg
+*.ps1xml
+
+# Logs/outputs
+*.log
+*.json
+!asa_audit_report.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
