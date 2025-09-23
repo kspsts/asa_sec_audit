@@ -1,5 +1,5 @@
 # ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
-# Version: 0.2.1
+# Version: 0.2.4
 
 [CmdletBinding()]
 param(
@@ -728,10 +728,54 @@ function Check-RESTAPI { param($Cfg)
   if($any){ New-Finding 'REST-API' 'REST API open to any' 'High' $false $any 'Restrict to mgmt/VPN subnets.' } else { New-Finding 'REST-API' 'REST API not wide-open' 'Info' $true }
 }
 
-function Check-WebVPNCiphers { param($Cfg)
-  $w = $Cfg.Lines | Where-Object { $_ -match '^\s*webvpn\b' -or $_ -match '^\s*ssl\s+encryption\s+' }
-  $weak = $Cfg.Lines | Where-Object { $_ -match '^\s*ssl\s+encryption\s+rc4-md5\b' -or $_ -match '\b3des\b' -or $_ -match '\bmd5\b' -or $_ -match '\bsha1\b' }
-  if($weak){ New-Finding 'WEBVPN-CIPHERS' 'Weak SSL cipher suite' 'High' $false ($w+$weak) 'Use TLS1.2/1.3 with AES-GCM.' } else { New-Finding 'WEBVPN-CIPHERS' 'SSL ciphers look ok' 'Info' $true $w }
+function Check-WebVPNCiphers {
+  param($Cfg)
+
+  $weak = New-Object System.Collections.Generic.List[string]
+
+  # 1) Явные слабые директивы (без заголовков "webvpn")
+  $patterns = @(
+    '^\s*ssl\s+encryption\s+.*\b(rc4|md5|3des|des)\b',              # ssl encryption rc4-md5 / 3des / des
+    '^\s*ssl\s+encryption\s+.*\bsha1\b',                            # CBC+SHA1
+    '^\s*ssl\s+cipher\s+dtlsv?1\.0.*\b(rc4|md5|3des|des|sha1)\b',   # DTLSv1.0 слабые
+    '^\s*anyconnect\s+ssl\s+cipher\s+rc4-md5\b',                    # RC4-MD5 в GP
+    '^\s*anyconnect\s+ssl\s+cipher\b.*\b(rc4|md5|3des|des|sha1)\b'  # любые слабые варианты в GP
+  )
+  foreach($line in $Cfg.Lines){
+    foreach($rx in $patterns){
+      if($line -match $rx){ [void]$weak.Add($line); break }
+    }
+  }
+
+  # 2) Кастомные списки DTLS: ssl cipher dtlsN custom "AES256-SHA:AES128-SHA:..."
+  foreach($line in $Cfg.Lines){
+    if($line -match '^\s*ssl\s+cipher\s+dtls\d+(?:\.0)?\s+custom\s+"([^"]+)"'){
+      $list = $matches[1] -split '[:;, ]+' | Where-Object { $_ }
+      $flagged = $false
+      foreach($c in $list){
+        $u = $c.ToUpperInvariant()
+        # ciphers вида AES256-SHA / ECDHE-RSA-AES128-SHA — это CBC+SHA1
+        if($u -match 'RC4|MD5|3DES|(^|[-_])DES($|[-_])' -or $u -match 'SHA(?!256|384|512)'){
+          # Добавляем строку с пояснением, какие элементы слабые
+          if(-not $flagged){
+            $bad = ($list | ForEach-Object { $_.ToUpperInvariant() } | Where-Object { $_ -match 'RC4|MD5|3DES|(^|[-_])DES($|[-_])' -or $_ -match 'SHA(?!256|384|512)' })
+            $note = if($bad){ '  ! WEAK: ' + ($bad -join ', ') } else { '' }
+            [void]$weak.Add($line + $note)
+            $flagged = $true
+          }
+        }
+      }
+    }
+  }
+
+  $weak = $weak | Select-Object -Unique
+
+  if($weak.Count -gt 0){
+    New-Finding 'WEBVPN-CIPHERS' 'Weak SSL cipher suite' 'High' $false $weak `
+      'Use TLS1.2/1.3 with AES-GCM; remove RC4/MD5/3DES/DES and CBC+SHA1.'
+  } else {
+    New-Finding 'WEBVPN-CIPHERS' 'SSL ciphers look ok' 'Info' $true
+  }
 }
 
 function Check-CA-CRL { param($Cfg)
