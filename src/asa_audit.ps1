@@ -1,5 +1,5 @@
 ﻿# ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
-# Version: 0.5.5
+# Version: 0.5.6
 
 [CmdletBinding()]
 param(
@@ -1820,19 +1820,18 @@ $CheckMap = [ordered]@{
   LoggingDTLS               = { param($cfg,$obj) Check-LoggingDTLS            -Cfg $cfg }
   ACProfileCipher           = { param($cfg,$obj) Check-AnyConnectProfileCipher -Cfg $cfg }
 
-  CertTrustpoint             = { param($cfg,$obj) Check-CertTrustpoint     -Cfg $cfg }
-  AAAAccounting              = { param($cfg,$obj) Check-AAA-Accounting     -Cfg $cfg }
-  NTP                        = { param($cfg,$obj) Check-NTP                 -Cfg $cfg }
-  VPNFilterDAP               = { param($cfg,$obj) Check-VPNFilterDAP        -Cfg $cfg }
-  ACLTimeRange               = { param($cfg,$obj) Check-ACLTimeRange        -Cfg $cfg }
-  ProxyARP                   = { param($cfg,$obj) Check-ProxyARP            -Cfg $cfg }
-  FailoverHygiene            = { param($cfg,$obj) Check-FailoverHygiene     -Cfg $cfg }
-  SameSecurity               = { param($cfg,$obj) Check-SameSecurity        -Cfg $cfg }
-  ManagementAccess           = { param($cfg,$obj) Check-ManagementAccess    -Cfg $cfg }
+  CertTrustpoint            = { param($cfg,$obj) Check-CertTrustpoint     -Cfg $cfg }
+  AAAAccounting             = { param($cfg,$obj) Check-AAA-Accounting     -Cfg $cfg }
+  NTP                       = { param($cfg,$obj) Check-NTP                 -Cfg $cfg }
+  VPNFilterDAP              = { param($cfg,$obj) Check-VPNFilterDAP        -Cfg $cfg }
+  ACLTimeRange              = { param($cfg,$obj) Check-ACLTimeRange        -Cfg $cfg }
+  ProxyARP                  = { param($cfg,$obj) Check-ProxyARP            -Cfg $cfg }
+  FailoverHygiene           = { param($cfg,$obj) Check-FailoverHygiene     -Cfg $cfg }
+  SameSecurity              = { param($cfg,$obj) Check-SameSecurity        -Cfg $cfg }
+  ManagementAccess          = { param($cfg,$obj) Check-ManagementAccess    -Cfg $cfg }
 
-  DMZtoInsideDeep = { param($cfg,$obj) Check-DMZtoInsideDeep -Cfg $cfg -Obj $obj }
-
-  ServerEgressNAT = { param($cfg,$obj) Check-ServerEgressNAT -Cfg $cfg -Obj $obj }
+  DMZtoInsideDeep           = { param($cfg,$obj) Check-DMZtoInsideDeep -Cfg $cfg -Obj $obj }
+  ServerEgressNAT           = { param($cfg,$obj) Check-ServerEgressNAT -Cfg $cfg -Obj $obj }
 }
 
 # ===================== Menu =====================
@@ -1849,8 +1848,10 @@ function Show-Menu {
   $idx = $sel -split '[,\s]+' | Where-Object { $_ }
   $chosen = @()
   foreach($x in $idx){
-    if($x -match '^\d+$'){ $n=[int]$x; if($n -ge 1 -and $n -le $keys.Count){ $chosen += $keys[$n-1] } }
-    elseif($Map.Contains($x)){ $chosen += $x }
+    if($x -match '^\d+$'){
+      $n=[int]$x
+      if($n -ge 1 -and $n -le $keys.Count){ $chosen += $keys[$n-1] }
+    } elseif($Map.Contains($x)){ $chosen += $x }
   }
   $chosen | Select-Object -Unique
 }
@@ -1886,8 +1887,13 @@ try {
     $findings += & $fn $cfg $obj
   }
 
-  # Единая точка вывода (консоль + JSON + HTML)
-  Write-AsaReport -Findings $findings -OutJson $OutJson -Chart:$Chart -Html:$Html -HtmlPath $HtmlPath -Lang $Lang
+  # единый вывод (консоль + JSON + HTML)
+  Write-AsaReport -Findings $findings `
+                  -OutJson $OutJson `
+                  -Chart:$Chart `
+                  -Html:$Html `
+                  -HtmlPath $HtmlPath `
+                  -Lang $Lang
 }
 catch {
   Write-Error ("Audit error: {0}" -f $_.Exception.Message)
