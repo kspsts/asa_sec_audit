@@ -1,5 +1,5 @@
 # ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
-# Version: 0.4.3
+# Version: 0.4.4
 
 [CmdletBinding()]
 param(
@@ -1405,7 +1405,8 @@ $CheckMap = [ordered]@{
   FailoverHygiene            = { param($cfg,$obj) Check-FailoverHygiene     -Cfg $cfg }
   SameSecurity               = { param($cfg,$obj) Check-SameSecurity        -Cfg $cfg }
   ManagementAccess           = { param($cfg,$obj) Check-ManagementAccess    -Cfg $cfg }
-  DMZtoInsideDeep           = { param($cfg,$obj) Check-DMZtoInsideDeep -Cfg $cfg -Obj $obj }
+
+  DMZtoInsideDeep = { param($cfg,$obj) Check-DMZtoInsideDeep -Cfg $cfg -Obj $obj }
 }
 
 # ===================== Menu =====================
