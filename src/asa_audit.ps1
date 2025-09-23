@@ -1,5 +1,5 @@
 ﻿# ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
-# Version: 0.5.4
+# Version: 0.5.5
 
 [CmdletBinding()]
 param(
@@ -292,12 +292,15 @@ function Get-IndexLines {
 function Write-AsaReport {
   param(
     [PSCustomObject[]]$Findings,
-    [string]$OutJson,
-    [switch]$Chart
+    [string]$OutJson = "asa_audit_report.json",
+    [switch]$Chart,
+    [switch]$Html,
+    [string]$HtmlPath = "asa_audit_report.html",
+    [ValidateSet('ru','en')][string]$Lang = 'ru'
   )
 
+  # Консоль + JSON
   $sorted = $Findings | Sort-Object @{Expression='Passed';Descending=$true}, @{Expression='Severity';Descending=$true}, 'Id'
-
   foreach($f in $sorted){
     $state = if($f.Passed){ '[OK]' } else { '[ISSUE]' }
     $color = if($f.Passed){ 'Green' } elseif($f.Severity -eq 'High'){'Red'} elseif($f.Severity -eq 'Medium'){'Yellow'} else {'Cyan'}
@@ -318,8 +321,12 @@ function Write-AsaReport {
       Write-Host ("{0,-6} {1,3} | {2}" -f $g.Name,$g.Count,$bar)
     }
   }
-}
 
+  # HTML (перевод делается внутри Export-AsaReportHtml → Translate-FindingRu)
+  if($Html){
+    Export-AsaReportHtml -Findings $Findings -Path $HtmlPath -Lang $Lang
+  }
+}
 
 # ============ Parsing: objects / groups ============
 
@@ -1855,16 +1862,22 @@ try {
   $obj = Build-AsaObjects -Cfg $cfg
 
   $toRun = @()
-  if($All){ $toRun = $CheckMap.Keys }
+  if($All){
+    $toRun = $CheckMap.Keys
+  }
   elseif($Checks){
     $toRun = $Checks | Where-Object { $CheckMap.Contains($_) }
     if(-not $toRun -or $toRun.Count -eq 0){
       Write-Host ("Unknown checks. Available: {0}" -f ($CheckMap.Keys -join ', ')) -ForegroundColor Yellow
       exit 1
     }
-  } else {
+  }
+  else {
     $toRun = Show-Menu -Map $CheckMap
-    if(-not $toRun -or $toRun.Count -eq 0){ Write-Host "Nothing selected." -ForegroundColor Yellow; exit 0 }
+    if(-not $toRun -or $toRun.Count -eq 0){
+      Write-Host "Nothing selected." -ForegroundColor Yellow
+      exit 0
+    }
   }
 
   $findings = @()
@@ -1872,8 +1885,10 @@ try {
     $fn = $CheckMap[$name]
     $findings += & $fn $cfg $obj
   }
-  Write-AsaReport -Findings $findings -OutJson $OutJson -Chart:$Chart
 
-  if($Html){
-    Export-AsaReportHtml -Findings $findings -Path $HtmlPath -Lang $Lang
+  # Единая точка вывода (консоль + JSON + HTML)
+  Write-AsaReport -Findings $findings -OutJson $OutJson -Chart:$Chart -Html:$Html -HtmlPath $HtmlPath -Lang $Lang
+}
+catch {
+  Write-Error ("Audit error: {0}" -f $_.Exception.Message)
 }
