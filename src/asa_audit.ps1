@@ -1,5 +1,5 @@
 ﻿# ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
-# Version: 0.5.7
+# Version: 0.5.8
 
 [CmdletBinding()]
 param(
@@ -1762,7 +1762,7 @@ function Check-ServerEgressNAT {
 function Get-SegmentMap {
   param($Cfg)
 
-  # Return: @{ SegByIf = @{ <nameif> = 'LAN'|'DMZ'|... }; IfMeta = [pscustomobject] Nameif,Sec }
+  # Return: @{ SegByIf = @{ <nameif> = 'LAN'|'DMZ'|... }; IfMeta = [pscustomobject] Nameif,Sec,Role }
   $ifMeta = @()
   $segByIf = @{}
 
@@ -1779,11 +1779,11 @@ function Get-SegmentMap {
     return 'OTHER'
   }
 
-  # Parse interface blocks
-  $lines = @(); if($Cfg -and $Cfg.Lines){ $lines = @($Cfg.Lines) }
+  $lines = @()
+  if($Cfg -and $Cfg.Lines){ $lines = @($Cfg.Lines) }
+
   for($i=0;$i -lt $lines.Count;$i++){
     if($lines[$i] -match '^\s*interface\s+(\S+)'){
-      $phys = $matches[1]
       $nameif = $null; $sec = $null
       for($j=$i+1; $j -lt $lines.Count -and $lines[$j] -match '^\s+'; $j++){
         if($lines[$j] -match '^\s*nameif\s+(\S+)'){ $nameif = $matches[1] }
@@ -1791,7 +1791,6 @@ function Get-SegmentMap {
       }
       if($nameif){
         $role = Classify-ByName $nameif
-        # If name didn't help, use security-level heuristic
         if($role -eq 'OTHER' -and $sec -ne $null){
           if($sec -ge 100){ $role = 'LAN' }
           elseif($sec -le 5){ $role = 'INET' }
@@ -1803,10 +1802,7 @@ function Get-SegmentMap {
     }
   }
 
-  return @{
-    SegByIf = $segByIf
-    IfMeta  = $ifMeta
-  }
+  return @{ SegByIf = $segByIf; IfMeta = $ifMeta }
 }
 
 function Check-InterSegmentFlows {
@@ -1814,7 +1810,6 @@ function Check-InterSegmentFlows {
 
   # Helpers (PS5.1-safe)
   function _Idx($cfg,$k){ if($cfg -and $cfg.Index -and $cfg.Index.Contains($k)){ @($cfg.Index[$k]) } else { @() } }
-  function _E($x){ if($null -eq $x){ @() } elseif($x -is [array]){ @($x) } else { @($x) } }
   function _IsRFC1918([string]$ip){
     if([string]::IsNullOrWhiteSpace($ip)){ return $false }
     if($ip -match '^10\.'){ return $true }
@@ -1829,46 +1824,6 @@ function Check-InterSegmentFlows {
     if($svc -match '\b(eq|lt|gt)\s+\d+\b'){ return $false }
     return $false
   }
-
-  # Need Parse-AclLine available in script
-  if(-not (Get-Command Parse-AclLine -ErrorAction SilentlyContinue)){
-    return New-Finding 'SEGM-FLOWS' 'Inter-segment analysis skipped (parser missing)' 'Info' $true
-  }
-
-  # Build binding map: ACL name -> [{Interface,Direction}]
-  $bindMap = @{}
-  foreach($g in _Idx $Cfg 'access-group'){
-    if($g -match '^\s*access-group\s+(?<name>\S+)\s+(?<dir>in|out)\s+(?:interface\s+(?<if>\S+)|global)\s*$'){
-      $n=$matches['name']; $d=$matches['dir']; $iface = ($matches['if'] ? $matches['if'] : 'global')
-      if(-not $bindMap.ContainsKey($n)){ $bindMap[$n] = New-Object System.Collections.Generic.List[object] }
-      [void]$bindMap[$n].Add([pscustomobject]@{ Interface=$iface; Direction=$d })
-    }
-  }
-
-  # Segment map
-  $seg = Get-SegmentMap -Cfg $Cfg
-  $segByIf = $seg.SegByIf
-  $ifMeta  = $seg.IfMeta
-
-  if($segByIf.Keys.Count -eq 0){
-    return New-Finding 'SEGM-MAP' 'No interfaces with nameif found' 'Info' $true
-  }
-
-  # Evidence list for map
-  $mapEv = @()
-  foreach($m in $ifMeta){
-    $mapEv += ("{0,-12} sec {1,-3} -> {2}" -f $m.Nameif, ($m.Sec -as [string]), $m.Role)
-  }
-  $mapFinding = New-Finding 'SEGM-MAP' 'Segment map (nameif -> role)' 'Info' $true $mapEv
-
-  # Prepare matrix counters
-  $roles = @('LAN','DMZ','PARTNER','WIFI','WAN','MGMT','INET','OTHER')
-  $matrix = @{}
-  foreach($s in $roles){ $matrix[$s] = @{}; foreach($d in $roles){ $matrix[$s][$d] = [pscustomobject]@{ Total=0; Wide=0; Narrow=0 } }
-
-  $samples = @{} # key "SRC->DST" -> list of sample strings
-
-  # Object/group name hints -> segment role
   function Classify-ByName([string]$name){
     if([string]::IsNullOrWhiteSpace($name)){ return 'OTHER' }
     $n = $name.ToLowerInvariant()
@@ -1881,28 +1836,66 @@ function Check-InterSegmentFlows {
     if($n -match '^(mgmt|oob)$'){ return 'MGMT' }
     return 'OTHER'
   }
-
-  # Resolve destination role heuristically from parsed token
   function Guess-DstRole([string]$dstType,[string]$dstVal){
-    # Objects/groups by name
     if($dstType -eq 'object' -or $dstType -eq 'og'){
       $r = Classify-ByName $dstVal
       if($r -ne 'OTHER'){ return $r }
-      # fallthrough
     }
-    # Subnet literal
     if($dstType -eq 'subnet'){
       $ip = ($dstVal -split '\s+')[0]
       if(_IsRFC1918 $ip){ return 'LAN' } else { return 'INET' }
     }
-    # Host literal
     if($dstType -eq 'host'){
       if(_IsRFC1918 $dstVal){ return 'LAN' } else { return 'INET' }
     }
-    # Any
-    if($dstType -eq 'any'){ return 'INET' } # conservative: "any" treated as internet-ish
+    if($dstType -eq 'any'){ return 'INET' }
     return 'OTHER'
   }
+
+  if(-not (Get-Command Parse-AclLine -ErrorAction SilentlyContinue)){
+    return New-Finding 'SEGM-FLOWS' 'Inter-segment analysis skipped (parser missing)' 'Info' $true
+  }
+
+  # Build binding map: ACL name -> [{Interface,Direction}]
+  $bindMap = @{}
+  foreach($g in _Idx $Cfg 'access-group'){
+    $m = [regex]::Match($g,'^\s*access-group\s+(?<name>\S+)\s+(?<dir>in|out)\s+(?:interface\s+(?<if>\S+)|global)\s*$',[System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if($m.Success){
+      $n = $m.Groups['name'].Value
+      $d = $m.Groups['dir'].Value
+      $iface = if($m.Groups['if'].Success){ $m.Groups['if'].Value } else { 'global' }
+      if(-not $bindMap.ContainsKey($n)){ $bindMap[$n] = New-Object System.Collections.Generic.List[object] }
+      [void]$bindMap[$n].Add([pscustomobject]@{ Interface=$iface; Direction=$d })
+    }
+  }
+
+  # Segment map
+  $seg = Get-SegmentMap -Cfg $Cfg
+  $segByIf = $seg.SegByIf
+  $ifMeta  = $seg.IfMeta
+
+  if(-not $segByIf -or $segByIf.Keys.Count -eq 0){
+    return New-Finding 'SEGM-MAP' 'No interfaces with nameif found' 'Info' $true
+  }
+
+  # Evidence: segment map
+  $mapEv = @()
+  foreach($m in $ifMeta){
+    $secTxt = if($m.Sec -ne $null){ $m.Sec } else { '-' }
+    $mapEv += ("{0,-12} sec {1,-3} -> {2}" -f $m.Nameif, $secTxt, $m.Role)
+  }
+  $mapFinding = New-Finding 'SEGM-MAP' 'Segment map (nameif -> role)' 'Info' $true $mapEv
+
+  # Prepare matrix counters
+  $roles = @('LAN','DMZ','PARTNER','WIFI','WAN','MGMT','INET','OTHER')
+  $matrix = @{}
+  foreach($s in $roles){
+    $matrix[$s] = @{}
+    foreach($d in $roles){
+      $matrix[$s][$d] = [pscustomobject]@{ Total=0; Wide=0; Narrow=0 }
+    }
+  }
+  $samples = @{}  # key "SRC->DST" -> List[string]
 
   # Walk ACL lines
   $aclLines = _Idx $Cfg 'access-list'
@@ -1910,44 +1903,42 @@ function Check-InterSegmentFlows {
     $p = Parse-AclLine -Line $ln
     if(-not $p -or $p.Action -ne 'permit'){ continue }
 
-    # Binding info for this ACL name
     $bindings = @()
     if($bindMap.ContainsKey($p.Name)){ $bindings = @($bindMap[$p.Name]) } else { $bindings = @([pscustomobject]@{ Interface='global'; Direction='in' }) }
 
     foreach($b in $bindings){
-      $srcRole = 'OTHER'; $dstRole = 'OTHER'
+      $srcRole = 'OTHER'
+      $dstRole = 'OTHER'
 
-      # Direction: ACL "in" on IF controls packets entering IF. We treat IF role as source segment.
-      $srcRole = ($segByIf.ContainsKey($b.Interface) ? $segByIf[$b.Interface] : 'OTHER')
+      if($segByIf.ContainsKey($b.Interface)){ $srcRole = $segByIf[$b.Interface] }
 
-      # Destination: guess by tokens
       $dstRole = Guess-DstRole $p.DstType $p.Dst
-
-      # If ACL name itself hints segment (sometimes ACL names encode it)
       if($dstRole -eq 'OTHER'){
         $dstRole = Classify-ByName $p.Name
       }
 
-      # Update counters
-      if(-not $matrix.ContainsKey($srcRole)){ $matrix[$srcRole] = @{}; foreach($d in $roles){ $matrix[$srcRole][$d] = [pscustomobject]@{ Total=0; Wide=0; Narrow=0 } }
-      if(-not $matrix[$srcRole].ContainsKey($dstRole)){ $matrix[$srcRole][$dstRole] = [pscustomobject]@{ Total=0; Wide=0; Narrow=0 } }
+      if(-not $matrix.ContainsKey($srcRole)){
+        $matrix[$srcRole] = @{}
+        foreach($d in $roles){ $matrix[$srcRole][$d] = [pscustomobject]@{ Total=0; Wide=0; Narrow=0 } }
+      }
+      if(-not $matrix[$srcRole].ContainsKey($dstRole)){
+        $matrix[$srcRole][$dstRole] = [pscustomobject]@{ Total=0; Wide=0; Narrow=0 }
+      }
 
       $matrix[$srcRole][$dstRole].Total++
       if(_SvcWide $p.Service){ $matrix[$srcRole][$dstRole].Wide++ } else { $matrix[$srcRole][$dstRole].Narrow++ }
 
       $key = "$srcRole->$dstRole"
       if(-not $samples.ContainsKey($key)){ $samples[$key] = New-Object System.Collections.Generic.List[string] }
-      $annot = $ln
-      $annot += ("  [{0} {1}]" -f $b.Interface,$b.Direction)
+      $annot = $ln + ("  [{0} {1}]" -f $b.Interface,$b.Direction)
       [void]$samples[$key].Add($annot)
     }
   }
 
-  # Build evidence text summary
+  # Build summary
   $sum = New-Object System.Collections.Generic.List[string]
   [void]$sum.Add('[Segment map]')
   foreach($m in $mapEv){ [void]$sum.Add($m) }
-
   [void]$sum.Add('')
   [void]$sum.Add('[Inter-segment flows (Total/Wide/Narrow)]')
   foreach($s in $roles){
@@ -1958,26 +1949,27 @@ function Check-InterSegmentFlows {
       }
     }
   }
-
   [void]$sum.Add('')
   [void]$sum.Add('[Examples]')
   $printed = 0
   foreach($k in $samples.Keys){
     $lst = $samples[$k] | Select-Object -Unique | Select-Object -First 5
-    foreach($x in $lst){ [void]$sum.Add("$k  ::  $x"); $printed++ ; if($printed -ge 60){ break } }
+    foreach($x in $lst){ [void]$sum.Add("$k  ::  $x"); $printed++; if($printed -ge 60){ break } }
     if($printed -ge 60){ break }
   }
 
-  # Severity: High if any Wide from DMZ/LAN/WIFI/PARTNER to INET; Medium if only Narrow; Info if nothing
+  # Severity
   $sev = 'Info'
   $hotSrc = @('LAN','DMZ','WIFI','PARTNER')
   $wideHit = $false; $traffic = $false
   foreach($s in $hotSrc){
-    if($matrix[$s]['INET'].Total -gt 0){ $traffic = $true; if($matrix[$s]['INET'].Wide -gt 0){ $wideHit = $true; break } }
+    if($matrix[$s]['INET'].Total -gt 0){
+      $traffic = $true
+      if($matrix[$s]['INET'].Wide -gt 0){ $wideHit = $true; break }
+    }
   }
   if($wideHit){ $sev = 'High' }
   elseif($traffic){ $sev = 'Medium' }
-  else { $sev = 'Info' }
 
   $rec = 'Review inter-segment rules; minimize DMZ/LAN to INET, keep least-privilege, limit ports; verify bindings per interface.'
   return @(
@@ -2059,9 +2051,7 @@ $CheckMap = [ordered]@{
 
   DMZtoInsideDeep           = { param($cfg,$obj) Check-DMZtoInsideDeep -Cfg $cfg -Obj $obj }
   ServerEgressNAT           = { param($cfg,$obj) Check-ServerEgressNAT -Cfg $cfg -Obj $obj }
-  SegmentMap                = { param($cfg,$obj) Get-SegmentMap -Cfg $cfg | Out-Null; New-Finding 'SEGM-MAP' 'Segment map collected' 'Info' $true }
-  InterSegmentFlows         = { param($cfg,$obj) Check-InterSegmentFlows -Cfg $cfg -Obj $obj }
-
+  InterSegmentFlows = { param($cfg,$obj) Check-InterSegmentFlows -Cfg $cfg -Obj $obj }
 }
 
 # ===================== Menu =====================
