@@ -1,7 +1,7 @@
 <# 
   asa_segments.ps1  — Inter-Segment Flow Analyzer for Cisco ASA
   PowerShell 5.1 compatible, ASCII-safe
-  v0.1
+  v0.1.1
 #>
 
 [CmdletBinding()]
@@ -131,7 +131,6 @@ function Parse-AclLine {
 }
 
 # ---------------- Segment inference ----------------
-# Known segments and keyword mapping
 $KnownSegments = @('DMZ','INET','LAN','PARTNER','WAN','WIFI','UNKNOWN')
 
 function Map-NameToSegment([string]$name){
@@ -152,7 +151,6 @@ function Build-InterfaceSegmentMap {
   foreach($i in $IfMeta){
     $seg = Map-NameToSegment $i.Nameif
     if($seg -eq 'UNKNOWN'){
-      # fallback by security-level: low ~ INET, mid ~ DMZ, high ~ LAN
       if($i.Sec -le 20){ $seg='INET' }
       elseif($i.Sec -le 70){ $seg='DMZ' }
       else{ $seg='LAN' }
@@ -166,19 +164,19 @@ function Map-ObjOrTokenToSegment {
   param(
     [string]$type,  # any|host|subnet|object|og|unknown
     [string]$val,
-    $ObjNames,      # set of object names
-    $GrpNames       # set of group names
+    $ObjNames,
+    $GrpNames
   )
   switch($type){
-    'any'    { return 'INET' } # "any" скорее всего включает Интернет
-    'host'   { return (_IsRFC1918 $val) ? 'LAN' : 'INET' }
+    'any'    { return 'INET' }
+    'host'   { if(_IsRFC1918 $val){ return 'LAN' } else { return 'INET' } }
     'subnet' {
       $ip = ($val -split '\s+')[0]
-      return (_IsRFC1918 $ip) ? 'LAN' : 'INET'
+      if(_IsRFC1918 $ip){ return 'LAN' } else { return 'INET' }
     }
-    'object' { return Map-NameToSegment $val }
-    'og'     { return Map-NameToSegment $val }
-    default  { return Map-NameToSegment $val }
+    'object' { return (Map-NameToSegment $val) }
+    'og'     { return (Map-NameToSegment $val) }
+    default  { return (Map-NameToSegment $val) }
   }
 }
 
@@ -205,7 +203,10 @@ function Out-MatrixHtml {
       $cnt = if($Matrix[$src].ContainsKey($dst)){ $Matrix[$src][$dst] } else { 0 }
       $ex  = if($Samples.ContainsKey("$src->$dst")){ $Samples["$src->$dst"][0] } else { $null }
       $cell = if($cnt -gt 0){ "$cnt" } else { "<span class='z'>0</span>" }
-      if($ex){ $cell = "$cell" + "<br/><span class='z' style='font-size:11px'>ex: " + [System.Web.HttpUtility]::HtmlEncode($ex) + "</span>" }
+      if($ex){
+        $enc = [System.Net.WebUtility]::HtmlEncode($ex)
+        $cell = "$cell<br/><span class='z' style='font-size:11px'>ex: $enc</span>"
+      }
       [void]$html.Append("<td>$cell</td>")
     }
     [void]$html.Append("</tr>")
@@ -247,13 +248,10 @@ try{
       $srcSegTok = Map-ObjOrTokenToSegment -type $p.SrcType -val $p.Src -ObjNames $objs.ObjectNames -GrpNames $objs.GroupNames
       $dstSegTok = Map-ObjOrTokenToSegment -type $p.DstType -val $p.Dst -ObjNames $objs.ObjectNames -GrpNames $objs.GroupNames
 
-      # Direction-aware override:
-      # ACL applied "in" on interface: source is likely from that interface segment.
-      # ACL "out": destination is likely that interface segment.
+      # Direction-aware override
       if($dir -eq 'in'){ $srcSeg = $ifaceSeg; $dstSeg = $dstSegTok }
       else { $srcSeg = $srcSegTok; $dstSeg = $ifaceSeg }
 
-      # Normalize UNKNOWN a bit: if token says INET and iface is LAN in, keep INET for dst; etc.
       if($srcSeg -eq 'UNKNOWN'){ $srcSeg = $srcSegTok }
       if($dstSeg -eq 'UNKNOWN'){ $dstSeg = $dstSegTok }
       if(-not ($KnownSegments -contains $srcSeg)){ $srcSeg = 'UNKNOWN' }
