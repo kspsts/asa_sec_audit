@@ -1,5 +1,5 @@
 ﻿# ASA Secure Config Audit (PS 5.1 compatible, ASCII-safe)
-# Version: 0.5.8
+# Version: 0.5.9
 
 [CmdletBinding()]
 param(
@@ -1759,223 +1759,182 @@ function Check-ServerEgressNAT {
   New-Finding 'SRV-NAT' 'Server egress via NAT to outside (object/twice/policy, identity detection)' $sev $false $ev $rec
 }
 
+# ========== Segment map & inter-segment flows (PS 5.1-safe) ==========
+
 function Get-SegmentMap {
   param($Cfg)
 
-  # Return: @{ SegByIf = @{ <nameif> = 'LAN'|'DMZ'|... }; IfMeta = [pscustomobject] Nameif,Sec,Role }
+  # Собираем interface -> {Nameif, Sec}
   $ifMeta = @()
-  $segByIf = @{}
+  $nameifs = @{}
 
-  function Classify-ByName([string]$nameif){
-    if([string]::IsNullOrWhiteSpace($nameif)){ return 'OTHER' }
-    $n = $nameif.ToLowerInvariant()
-    if($n -match '^(outside|inet|internet|ext|wan)$'){ return 'INET' }
-    if($n -match '^(inside|lan|corp|internal|intranet|pci)$'){ return 'LAN' }
-    if($n -match '^(dmz|public|online|guest)$'){ return 'DMZ' }
-    if($n -match '^(partner|b2b)$'){ return 'PARTNER' }
-    if($n -match '^(wan|uplink|provider)$'){ return 'WAN' }
-    if($n -match '^(wifi|wlan)$'){ return 'WIFI' }
-    if($n -match '^(mgmt|management0/0|oob)$'){ return 'MGMT' }
-    return 'OTHER'
-  }
-
-  $lines = @()
-  if($Cfg -and $Cfg.Lines){ $lines = @($Cfg.Lines) }
-
-  for($i=0;$i -lt $lines.Count;$i++){
-    if($lines[$i] -match '^\s*interface\s+(\S+)'){
-      $nameif = $null; $sec = $null
-      for($j=$i+1; $j -lt $lines.Count -and $lines[$j] -match '^\s+'; $j++){
-        if($lines[$j] -match '^\s*nameif\s+(\S+)'){ $nameif = $matches[1] }
-        elseif($lines[$j] -match '^\s*security-level\s+(\d+)\b'){ $sec = [int]$matches[1] }
-      }
-      if($nameif){
-        $role = Classify-ByName $nameif
-        if($role -eq 'OTHER' -and $sec -ne $null){
-          if($sec -ge 100){ $role = 'LAN' }
-          elseif($sec -le 5){ $role = 'INET' }
-          elseif($sec -le 30){ $role = 'DMZ' }
+  if($Cfg -and $Cfg.Lines){
+    for($i=0;$i -lt $Cfg.Lines.Count;$i++){
+      if($Cfg.Lines[$i] -match '^\s*interface\s+(\S+)'){
+        $phys = $matches[1]; $curName = $null; $curSec = $null
+        for($j=$i+1; $j -lt $Cfg.Lines.Count -and $Cfg.Lines[$j] -match '^\s+'; $j++){
+          if($Cfg.Lines[$j] -match '^\s*nameif\s+(\S+)'){ $curName=$matches[1]; $nameifs[$phys]=$curName }
+          elseif($Cfg.Lines[$j] -match '^\s*security-level\s+(\d+)\b'){ $curSec=[int]$matches[1] }
         }
-        $ifMeta += [pscustomobject]@{ Nameif=$nameif; Sec=$sec; Role=$role }
-        $segByIf[$nameif] = $role
+        if($curName){ $ifMeta += [pscustomobject]@{ Nameif=$curName; Sec=$curSec } }
       }
     }
   }
 
-  return @{ SegByIf = $segByIf; IfMeta = $ifMeta }
+  # Роль по имени/уровню
+  function _Role($nameif,$sec){
+    $n = if($nameif){ $nameif.ToLower() } else { '' }
+    if($n -match '\b(dmz|guest|online|public|partner)\b'){ return 'DMZ' }
+    if($n -match '\b(wifi|wlan)\b'){ return 'WIFI' }
+    if($n -match '\b(lan|inside|internal|corp|intranet|pci)\b'){ return 'LAN' }
+    if($n -match '\b(outside|inet|internet|wan)\b'){ return 'INET' }
+    if($n -match '\b(partner|xsite|mpls)\b'){ return 'PARTNER' }
+    if($n -match '\b(wan|uplink)\b'){ return 'WAN' }
+    # по security-level
+    if($sec -eq 0){ return 'INET' }
+    if($sec -ge 1 -and $sec -le 40){ return 'DMZ' }
+    if($sec -ge 90){ return 'LAN' }
+    return 'OTHER'
+  }
+
+  $map = @{}   # nameif -> роль
+  foreach($m in $ifMeta){
+    $map[$m.Nameif] = _Role $m.Nameif $m.Sec
+  }
+
+  [pscustomobject]@{
+    IfMeta = $ifMeta
+    NameifToRole = $map
+  }
 }
 
 function Check-InterSegmentFlows {
   param($Cfg,$Obj)
 
-  # Helpers (PS5.1-safe)
-  function _Idx($cfg,$k){ if($cfg -and $cfg.Index -and $cfg.Index.Contains($k)){ @($cfg.Index[$k]) } else { @() } }
-  function _IsRFC1918([string]$ip){
-    if([string]::IsNullOrWhiteSpace($ip)){ return $false }
-    if($ip -match '^10\.'){ return $true }
-    if($ip -match '^192\.168\.'){ return $true }
-    if($ip -match '^172\.(1[6-9]|2\d|3[0-1])\.'){ return $true }
-    return $false
+  # Требуется Parse-AclLine и карта привязок access-group
+  if(-not $Cfg -or -not $Cfg.Lines){ return New-Finding 'SEGM-MAP' 'No config lines' 'Info' $true }
+
+  $seg = Get-SegmentMap -Cfg $Cfg
+  $roles = $seg.NameifToRole
+
+  # access-group: ACL -> [{Interface,Direction}]
+  $bind = @{}
+  $agLines = @()
+  if($Cfg.Index -and $Cfg.Index.Contains('access-group')){ $agLines = @($Cfg.Index['access-group']) }
+  foreach($g in $agLines){
+    if($g -match '^\s*access-group\s+(\S+)\s+(in|out)\s+interface\s+(\S+)'){
+      $acl=$matches[1]; $dir=$matches[2]; $ifc=$matches[3]
+      if(-not $bind.ContainsKey($acl)){ $bind[$acl] = New-Object System.Collections.Generic.List[object] }
+      [void]$bind[$acl].Add([pscustomobject]@{ Interface=$ifc; Direction=$dir; Role=( if($roles.ContainsKey($ifc)){$roles[$ifc]}else{'OTHER'}) })
+    }
   }
-  function _SvcWide([string]$svc){
+
+  # Собираем ACL
+  $acls = @()
+  if($Cfg.Index -and $Cfg.Index.Contains('access-list')){ $acls = @($Cfg.Index['access-list']) }
+  if($acls.Count -eq 0){
+    return New-Finding 'SEGM-FLOWS' 'No access-list entries for inter-segment analysis' 'Info' $true
+  }
+
+  # Счётчики потоков: SrcRole -> DstRole -> {Total, Wide, Narrow, Samples}
+  $matrix = @{}
+  function _Bump($s,$d,$wide,$sample){
+    if(-not $matrix.ContainsKey($s)){ $matrix[$s]=@{} }
+    if(-not $matrix[$s].ContainsKey($d)){
+      $matrix[$s][$d]=[pscustomobject]@{ Total=0; Wide=0; Narrow=0; Samples=New-Object System.Collections.Generic.List[string] }
+    }
+    $m=$matrix[$s][$d]; $m.Total++
+    if($wide){ $m.Wide++ } else { $m.Narrow++ }
+    if($m.Samples.Count -lt 8){ [void]$m.Samples.Add($sample) }
+  }
+
+  # Вспом. определение «широты» сервиса
+  function _IsWideSvc([string]$svc,[string]$proto){
     if([string]::IsNullOrWhiteSpace($svc)){ return $true }
-    if($svc -match '^\s*ip\s*$'){ return $true }
+    if($proto -match '^(?i)ip$'){ return $true }
     if($svc -match '\brange\s+\d+\s+\d+\b'){ return $true }
     if($svc -match '\b(eq|lt|gt)\s+\d+\b'){ return $false }
     return $false
   }
-  function Classify-ByName([string]$name){
-    if([string]::IsNullOrWhiteSpace($name)){ return 'OTHER' }
-    $n = $name.ToLowerInvariant()
-    if($n -match '^(outside|inet|internet|ext|wan)$'){ return 'INET' }
-    if($n -match '^(inside|lan|corp|internal|intranet|pci)$'){ return 'LAN' }
-    if($n -match '^(dmz|public|online|guest)$'){ return 'DMZ' }
-    if($n -match '^(partner|b2b)$'){ return 'PARTNER' }
-    if($n -match '^(wan|uplink|provider)$'){ return 'WAN' }
-    if($n -match '^(wifi|wlan)$'){ return 'WIFI' }
-    if($n -match '^(mgmt|oob)$'){ return 'MGMT' }
-    return 'OTHER'
-  }
-  function Guess-DstRole([string]$dstType,[string]$dstVal){
-    if($dstType -eq 'object' -or $dstType -eq 'og'){
-      $r = Classify-ByName $dstVal
-      if($r -ne 'OTHER'){ return $r }
-    }
-    if($dstType -eq 'subnet'){
-      $ip = ($dstVal -split '\s+')[0]
-      if(_IsRFC1918 $ip){ return 'LAN' } else { return 'INET' }
-    }
-    if($dstType -eq 'host'){
-      if(_IsRFC1918 $dstVal){ return 'LAN' } else { return 'INET' }
-    }
-    if($dstType -eq 'any'){ return 'INET' }
-    return 'OTHER'
-  }
 
-  if(-not (Get-Command Parse-AclLine -ErrorAction SilentlyContinue)){
-    return New-Finding 'SEGM-FLOWS' 'Inter-segment analysis skipped (parser missing)' 'Info' $true
-  }
+  # Подготовим набор имён объектов/групп для эвристики «серверов» (не критично)
+  $serverNames = New-Object System.Collections.Generic.HashSet[string]
+  if($Obj){ foreach($h in @($Obj.ObjectHosts.Keys + $Obj.ObjectSubnets.Keys + $Obj.GroupHosts.Keys + $Obj.GroupSubnets.Keys)){ if($h){ [void]$serverNames.Add($h) } } }
 
-  # Build binding map: ACL name -> [{Interface,Direction}]
-  $bindMap = @{}
-  foreach($g in _Idx $Cfg 'access-group'){
-    $m = [regex]::Match($g,'^\s*access-group\s+(?<name>\S+)\s+(?<dir>in|out)\s+(?:interface\s+(?<if>\S+)|global)\s*$',[System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    if($m.Success){
-      $n = $m.Groups['name'].Value
-      $d = $m.Groups['dir'].Value
-      $iface = if($m.Groups['if'].Success){ $m.Groups['if'].Value } else { 'global' }
-      if(-not $bindMap.ContainsKey($n)){ $bindMap[$n] = New-Object System.Collections.Generic.List[object] }
-      [void]$bindMap[$n].Add([pscustomobject]@{ Interface=$iface; Direction=$d })
-    }
-  }
-
-  # Segment map
-  $seg = Get-SegmentMap -Cfg $Cfg
-  $segByIf = $seg.SegByIf
-  $ifMeta  = $seg.IfMeta
-
-  if(-not $segByIf -or $segByIf.Keys.Count -eq 0){
-    return New-Finding 'SEGM-MAP' 'No interfaces with nameif found' 'Info' $true
-  }
-
-  # Evidence: segment map
-  $mapEv = @()
-  foreach($m in $ifMeta){
-    $secTxt = if($m.Sec -ne $null){ $m.Sec } else { '-' }
-    $mapEv += ("{0,-12} sec {1,-3} -> {2}" -f $m.Nameif, $secTxt, $m.Role)
-  }
-  $mapFinding = New-Finding 'SEGM-MAP' 'Segment map (nameif -> role)' 'Info' $true $mapEv
-
-  # Prepare matrix counters
-  $roles = @('LAN','DMZ','PARTNER','WIFI','WAN','MGMT','INET','OTHER')
-  $matrix = @{}
-  foreach($s in $roles){
-    $matrix[$s] = @{}
-    foreach($d in $roles){
-      $matrix[$s][$d] = [pscustomobject]@{ Total=0; Wide=0; Narrow=0 }
-    }
-  }
-  $samples = @{}  # key "SRC->DST" -> List[string]
-
-  # Walk ACL lines
-  $aclLines = _Idx $Cfg 'access-list'
-  foreach($ln in $aclLines){
-    $p = Parse-AclLine -Line $ln
+  # Проходим по ACL
+  foreach($raw in $acls){
+    $p = Parse-AclLine -Line $raw
     if(-not $p -or $p.Action -ne 'permit'){ continue }
 
-    $bindings = @()
-    if($bindMap.ContainsKey($p.Name)){ $bindings = @($bindMap[$p.Name]) } else { $bindings = @([pscustomobject]@{ Interface='global'; Direction='in' }) }
-
-    foreach($b in $bindings){
-      $srcRole = 'OTHER'
-      $dstRole = 'OTHER'
-
-      if($segByIf.ContainsKey($b.Interface)){ $srcRole = $segByIf[$b.Interface] }
-
-      $dstRole = Guess-DstRole $p.DstType $p.Dst
-      if($dstRole -eq 'OTHER'){
-        $dstRole = Classify-ByName $p.Name
+    # Где привязан ACL, чтобы понять «зону источника»?
+    $srcRole = 'UNKNOWN'; $dstRole = 'UNKNOWN'
+    if($bind.ContainsKey($p.Name)){
+      # Если ACL in на интерфейсе X — источник снаружи X (роль интерфейса), назначение внутрь
+      # Это приблизительно, но годится для матрицы.
+      foreach($b in $bind[$p.Name]){
+        if($b.Direction -eq 'in'){ $srcRole = $b.Role }
       }
+    }
 
-      if(-not $matrix.ContainsKey($srcRole)){
-        $matrix[$srcRole] = @{}
-        foreach($d in $roles){ $matrix[$srcRole][$d] = [pscustomobject]@{ Total=0; Wide=0; Narrow=0 } }
-      }
-      if(-not $matrix[$srcRole].ContainsKey($dstRole)){
-        $matrix[$srcRole][$dstRole] = [pscustomobject]@{ Total=0; Wide=0; Narrow=0 }
-      }
+    # Эвристика по содержимому: если destination — объект/группа/host из RFC1918 и имя похоже на inside — считаем Dst=LAN
+    $dstRoleGuess = $dstRole
+    $dstVal = $p.Dst
+    if($p.DstType -eq 'og' -or $p.DstType -eq 'object'){
+      if($dstVal -match '(?i)\b(inside|internal|corp|lan|intranet|pci)\b'){ $dstRoleGuess = 'LAN' }
+      elseif($dstVal -match '(?i)\b(dmz|guest|online|public|partner)\b'){ $dstRoleGuess = 'DMZ' }
+    } elseif($p.DstType -eq 'subnet'){
+      if($dstVal -match '^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[0-1])\.'){ $dstRoleGuess = 'LAN' } else { $dstRoleGuess = 'INET' }
+    } elseif($p.DstType -eq 'any'){ $dstRoleGuess = 'INET' }
+    $dstRole = if($dstRole -eq 'UNKNOWN' -and $dstRoleGuess -ne 'UNKNOWN'){ $dstRoleGuess } else { $dstRole }
 
-      $matrix[$srcRole][$dstRole].Total++
-      if(_SvcWide $p.Service){ $matrix[$srcRole][$dstRole].Wide++ } else { $matrix[$srcRole][$dstRole].Narrow++ }
+    # Если ничего не поняли по привязке — догадаемся по имени ACL
+    if($srcRole -eq 'UNKNOWN'){
+      if($p.Name -match '(?i)outside'){ $srcRole='INET' }
+      elseif($p.Name -match '(?i)dmz|guest|online|public'){ $srcRole='DMZ' }
+      elseif($p.Name -match '(?i)inside|lan|internal|corp|intranet'){ $srcRole='LAN' }
+    }
 
-      $key = "$srcRole->$dstRole"
-      if(-not $samples.ContainsKey($key)){ $samples[$key] = New-Object System.Collections.Generic.List[string] }
-      $annot = $ln + ("  [{0} {1}]" -f $b.Interface,$b.Direction)
-      [void]$samples[$key].Add($annot)
+    if($srcRole -eq 'UNKNOWN'){ $srcRole='OTHER' }
+    if($dstRole -eq 'UNKNOWN'){ $dstRole='OTHER' }
+
+    $wide = _IsWideSvc $p.Service $p.Proto
+    _Bump $srcRole $dstRole $wide ($raw.Trim())
+  }
+
+  # Сводка
+  $ev = New-Object System.Collections.Generic.List[string]
+  [void]$ev.Add('[Segment map]')
+  foreach($m in $seg.IfMeta){
+    [void]$ev.Add( ('{0,-12} sec {1,3} -> {2}' -f $m.Nameif,$m.Sec, ( if($roles.ContainsKey($m.Nameif)){$roles[$m.Nameif]}else{'OTHER'})) )
+  }
+  [void]$ev.Add('')
+  [void]$ev.Add('[Inter-segment flows (Total/Wide/Narrow)]')
+
+  $sev='Info'
+  foreach($s in $matrix.Keys){
+    foreach($d in $matrix[$s].Keys){
+      $m = $matrix[$s][$d]
+      [void]$ev.Add( ('{0,-8} -> {1,-8} : T={2} W={3} N={4}' -f $s,$d,$m.Total,$m.Wide,$m.Narrow) )
+      if($s -eq 'DMZ' -and $d -eq 'LAN' -and $m.Wide -gt 0){ $sev='High' }
+      if($s -eq 'LAN' -and $d -eq 'INET' -and $m.Wide -gt 0 -and $sev -ne 'High'){ $sev='Medium' }
     }
   }
 
-  # Build summary
-  $sum = New-Object System.Collections.Generic.List[string]
-  [void]$sum.Add('[Segment map]')
-  foreach($m in $mapEv){ [void]$sum.Add($m) }
-  [void]$sum.Add('')
-  [void]$sum.Add('[Inter-segment flows (Total/Wide/Narrow)]')
-  foreach($s in $roles){
-    foreach($d in $roles){
-      $c = $matrix[$s][$d]
-      if($c -and $c.Total -gt 0){
-        [void]$sum.Add(("{0,-8} -> {1,-8} : T={2} W={3} N={4}" -f $s,$d,$c.Total,$c.Wide,$c.Narrow))
-      }
+  # Примеры
+  [void]$ev.Add('')
+  [void]$ev.Add('[Samples]')
+  $shown=0
+  foreach($s in $matrix.Keys){ foreach($d in $matrix[$s].Keys){
+    foreach($smpl in $matrix[$s][$d].Samples){
+      [void]$ev.Add( ('{0}->{1} :: {2}' -f $s,$d,$smpl) )
+      $shown++; if($shown -ge 12){ break }
     }
-  }
-  [void]$sum.Add('')
-  [void]$sum.Add('[Examples]')
-  $printed = 0
-  foreach($k in $samples.Keys){
-    $lst = $samples[$k] | Select-Object -Unique | Select-Object -First 5
-    foreach($x in $lst){ [void]$sum.Add("$k  ::  $x"); $printed++; if($printed -ge 60){ break } }
-    if($printed -ge 60){ break }
-  }
+    if($shown -ge 12){ break }
+  } if($shown -ge 12){ break } }
 
-  # Severity
-  $sev = 'Info'
-  $hotSrc = @('LAN','DMZ','WIFI','PARTNER')
-  $wideHit = $false; $traffic = $false
-  foreach($s in $hotSrc){
-    if($matrix[$s]['INET'].Total -gt 0){
-      $traffic = $true
-      if($matrix[$s]['INET'].Wide -gt 0){ $wideHit = $true; break }
-    }
-  }
-  if($wideHit){ $sev = 'High' }
-  elseif($traffic){ $sev = 'Medium' }
-
-  $rec = 'Review inter-segment rules; minimize DMZ/LAN to INET, keep least-privilege, limit ports; verify bindings per interface.'
-  return @(
-    $mapFinding,
-    (New-Finding 'SEGM-FLOWS' 'Inter-segment flows (direction-aware matrix)' $sev ($sev -eq 'Info') $sum $rec)
-  )
+  $rec='Проверить межсегментные потоки: минимизировать широкие правила, оставлять только необходимые сервисы; DMZ→LAN ограничивать адресно и по портам.'
+  New-Finding 'SEGM-MAP'   'Segment roles mapping (nameif→role)' 'Info' $true ($ev[0..([Math]::Min(($ev.Count-1),15))])
+  New-Finding 'SEGM-FLOWS' 'Inter-segment flows summary' $sev $false ($ev | Select-Object -Skip 1) $rec
 }
 
 # ===================== Registry =====================
@@ -2051,7 +2010,7 @@ $CheckMap = [ordered]@{
 
   DMZtoInsideDeep           = { param($cfg,$obj) Check-DMZtoInsideDeep -Cfg $cfg -Obj $obj }
   ServerEgressNAT           = { param($cfg,$obj) Check-ServerEgressNAT -Cfg $cfg -Obj $obj }
-  InterSegmentFlows = { param($cfg,$obj) Check-InterSegmentFlows -Cfg $cfg -Obj $obj }
+  InterSegmentFlows         = { param($cfg,$obj) Check-InterSegmentFlows -Cfg $cfg -Obj $obj }
 }
 
 # ===================== Menu =====================
