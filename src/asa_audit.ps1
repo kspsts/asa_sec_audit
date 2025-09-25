@@ -10,6 +10,7 @@ param(
   [string]$OutJson = "asa_audit_report.json",
   [switch]$Chart,
   [string]$HtmlPath = 'asa_audit_report.html',
+  [string]$NatMapPath = '',
   [ValidateSet('ru','en')][string]$Lang = 'ru'
 )
 
@@ -256,22 +257,65 @@ function Read-AsaConfig {
   param([string]$Path)
   $raw   = Get-Content -Raw -Encoding UTF8 -ErrorAction Stop $Path
   $lines = $raw -split "`r?`n"
-  $idx   = [ordered]@{}
-  foreach($pfx in @(
-    'access-list','access-group','object ','object-group','telnet','ssh ',
-    'http ','http server','enable password','username','passwd','aaa ',
-    'snmp-server','logging ','threat-detection','icmp ',
-    'crypto ikev1 policy','crypto ikev2 policy','crypto key','isakmp ',
-    'crypto ipsec ikev1 transform-set','crypto map',
-    'webvpn','policy-map','class-map','inspect ',
-    'service password-encryption','ssh version',
-    'rest-api','ipsec security-association ','split-tunnel-network-list',
-    'vpn-tunnel-protocol','anyconnect ssl cipher','ssl cipher version',
-    'ssl dh-group','dynamic-filter','botnet-traffic-filter',
-    'ssl dtls-version','anyconnect dtls version','ssl cipher dtls','ssl key-exchange'
-  )){
-    $idx[$pfx] = $lines | Where-Object { $_ -match ('^\s*' + [regex]::Escape($pfx)) }
+  $indexSpecs = @(
+    @{ Key='access-list';                 Pattern='^(?i)\s*access-list\b' },
+    @{ Key='access-group';                Pattern='^(?i)\s*access-group\b' },
+    @{ Key='object ';                     Pattern='^(?i)\s*object\s+' },
+    @{ Key='object-group';                Pattern='^(?i)\s*object-group\b' },
+    @{ Key='telnet';                      Pattern='^(?i)\s*telnet\b' },
+    @{ Key='ssh ';                        Pattern='^(?i)\s*ssh\s+' },
+    @{ Key='http ';                       Pattern='^(?i)\s*http\s+' },
+    @{ Key='http server';                 Pattern='^(?i)\s*http\s+server\b' },
+    @{ Key='enable password';             Pattern='^(?i)\s*enable\s+password\b' },
+    @{ Key='username';                    Pattern='^(?i)\s*username\b' },
+    @{ Key='passwd';                      Pattern='^(?i)\s*passwd\b' },
+    @{ Key='aaa ';                        Pattern='^(?i)\s*aaa\s+' },
+    @{ Key='snmp-server';                 Pattern='^(?i)\s*snmp-server\b' },
+    @{ Key='logging ';                    Pattern='^(?i)\s*logging\b' },
+    @{ Key='threat-detection';            Pattern='^(?i)\s*threat-detection\b' },
+    @{ Key='icmp ';                       Pattern='^(?i)\s*icmp\s+' },
+    @{ Key='crypto ikev1 policy';         Pattern='^(?i)\s*crypto\s+ikev1\s+policy\b' },
+    @{ Key='crypto ikev2 policy';         Pattern='^(?i)\s*crypto\s+ikev2\s+policy\b' },
+    @{ Key='crypto key';                  Pattern='^(?i)\s*crypto\s+key\b' },
+    @{ Key='isakmp ';                     Pattern='^(?i)\s*isakmp\s+' },
+    @{ Key='crypto ipsec ikev1 transform-set'; Pattern='^(?i)\s*crypto\s+ipsec\s+ikev1\s+transform-set\b' },
+    @{ Key='crypto map';                  Pattern='^(?i)\s*crypto\s+map\b' },
+    @{ Key='webvpn';                      Pattern='^(?i)\s*webvpn\b' },
+    @{ Key='policy-map';                  Pattern='^(?i)\s*policy-map\b' },
+    @{ Key='class-map';                   Pattern='^(?i)\s*class-map\b' },
+    @{ Key='inspect ';                    Pattern='^(?i)\s*inspect\s+' },
+    @{ Key='service password-encryption'; Pattern='^(?i)\s*service\s+password-encryption\b' },
+    @{ Key='ssh version';                 Pattern='^(?i)\s*ssh\s+version\b' },
+    @{ Key='rest-api';                    Pattern='^(?i)\s*rest-api\b' },
+    @{ Key='ipsec security-association '; Pattern='^(?i)\s*ipsec\s+security-association\b' },
+    @{ Key='split-tunnel-network-list';   Pattern='^(?i)\s*split-tunnel-network-list\b' },
+    @{ Key='vpn-tunnel-protocol';         Pattern='^(?i)\s*vpn-tunnel-protocol\b' },
+    @{ Key='anyconnect ssl cipher';       Pattern='^(?i)\s*anyconnect\s+ssl\s+cipher\b' },
+    @{ Key='ssl cipher version';          Pattern='^(?i)\s*ssl\s+cipher\s+version\b' },
+    @{ Key='ssl dh-group';                Pattern='^(?i)\s*ssl\s+dh-group\b' },
+    @{ Key='dynamic-filter';              Pattern='^(?i)\s*dynamic-filter\b' },
+    @{ Key='botnet-traffic-filter';       Pattern='^(?i)\s*botnet-traffic-filter\b' },
+    @{ Key='ssl dtls-version';            Pattern='^(?i)\s*ssl\s+dtls-version\b' },
+    @{ Key='anyconnect dtls version';     Pattern='^(?i)\s*anyconnect\s+dtls\s+version\b' },
+    @{ Key='ssl cipher dtls';             Pattern='^(?i)\s*ssl\s+cipher\s+dtls' },
+    @{ Key='ssl key-exchange';            Pattern='^(?i)\s*ssl\s+key-exchange\b' }
+  )
+
+  $idx = [ordered]@{}
+  foreach($spec in $indexSpecs){
+    $idx[$spec.Key] = [System.Collections.Generic.List[string]]::new()
   }
+
+  foreach($line in $lines){
+    foreach($spec in $indexSpecs){
+      if($line -match $spec.Pattern){ [void]$idx[$spec.Key].Add($line) }
+    }
+  }
+
+  foreach($key in @($idx.Keys)){
+    $idx[$key] = $idx[$key].ToArray()
+  }
+
   [PSCustomObject]@{ Raw=$raw; Lines=$lines; Index=$idx }
 }
 
@@ -289,6 +333,319 @@ function Get-IndexLines {
   if($Cfg -and $Cfg.Index -and $Cfg.Index.Contains($Key)) { @($Cfg.Index[$Key]) } else { @() }
 }
 
+function Get-AclBindingMap {
+  param($Cfg)
+
+  $map = @{}
+  foreach($line in (Get-IndexLines -Cfg $Cfg -Key 'access-group')){
+    $m = [regex]::Match($line,'^\s*access-group\s+(?<name>\S+)\s+(?<dir>in|out)\s+(?:interface\s+(?<if>\S+)|global)\s*$', 'IgnoreCase')
+    if(-not $m.Success){ continue }
+    $name = $m.Groups['name'].Value
+    if(-not $map.ContainsKey($name)){
+      $map[$name] = [System.Collections.Generic.List[object]]::new()
+    }
+    $interface = if($m.Groups['if'].Success){ $m.Groups['if'].Value } else { 'global' }
+    [void]$map[$name].Add([PSCustomObject]@{ Interface=$interface; Direction=$m.Groups['dir'].Value })
+  }
+  foreach($key in @($map.Keys)){
+    $map[$key] = $map[$key].ToArray()
+  }
+  return $map
+}
+
+$script:ServerNatMapCache = $null
+
+function Get-ServerNatMap {
+  param($Cfg,$Obj)
+
+  if($script:ServerNatMapCache){ return $script:ServerNatMapCache }
+
+  function _E($x){ if($null -eq $x){ @() } elseif($x -is [array]){ @($x) } else { @($x) } }
+  function _Idx($cfg,$k){ if($cfg -and $cfg.Index -and $cfg.Index.Contains($k)){ @($cfg.Index[$k]) } else { @() } }
+  function _Keys($h){ if($h -and $h.PSObject.Properties['Keys']){ @($h.Keys) } else { @() } }
+  function _IsRFC1918([string]$ip){
+    if([string]::IsNullOrWhiteSpace($ip)){ return $false }
+    if($ip -match '^10\.') { return $true }
+    if($ip -match '^192\.168\.'){ return $true }
+    if($ip -match '^172\.(1[6-9]|2\d|3[0-1])\.') { return $true }
+    return $false
+  }
+  function _NameFromRef([string]$ref){
+    if($ref -match '^(object|object-group)\s+(\S+)$'){ return $matches[2] }
+    return $ref
+  }
+  function _AddUnique([System.Collections.Generic.List[string]]$list,[string]$value){
+    if([string]::IsNullOrWhiteSpace($value)){ return }
+    if(-not $list.Contains($value)){ [void]$list.Add($value) }
+  }
+  $hostsCache = @{}
+  $subnetsCache = @{}
+
+  function _CollectHosts($Obj,$name){
+    if($hostsCache.ContainsKey($name)){ return $hostsCache[$name] }
+    $hosts = [System.Collections.Generic.List[string]]::new()
+    if($Obj -and $Obj.ObjectHosts -and $Obj.ObjectHosts.ContainsKey($name)){
+      foreach($ip in $Obj.ObjectHosts[$name]){ _AddUnique $hosts $ip }
+    }
+    if($Obj -and $Obj.GroupHosts -and $Obj.GroupHosts.ContainsKey($name)){
+      foreach($ip in $Obj.GroupHosts[$name]){ _AddUnique $hosts $ip }
+    }
+    $hostsCache[$name] = $hosts
+    return $hosts
+  }
+  function _CollectSubnets($Obj,$name){
+    if($subnetsCache.ContainsKey($name)){ return $subnetsCache[$name] }
+    $subs = [System.Collections.Generic.List[string]]::new()
+    if($Obj -and $Obj.ObjectSubnets -and $Obj.ObjectSubnets.ContainsKey($name)){
+      foreach($sn in $Obj.ObjectSubnets[$name]){ _AddUnique $subs $sn }
+    }
+    if($Obj -and $Obj.GroupSubnets -and $Obj.GroupSubnets.ContainsKey($name)){
+      foreach($sn in $Obj.GroupSubnets[$name]){ _AddUnique $subs $sn }
+    }
+    $subnetsCache[$name] = $subs
+    return $subs
+  }
+
+  $lines = @()
+  if($Cfg -and $Cfg.Lines){ $lines = @($Cfg.Lines) }
+  if($lines.Count -eq 0){
+    $script:ServerNatMapCache = @()
+    return $script:ServerNatMapCache
+  }
+
+  $serverHint = '(?i)(server|srv|app|web|www|db|sql|rdp|ts|jump|bastion|proxy|gw|dmz)'
+  $serverNames = [System.Collections.Generic.HashSet[string]]::new()
+  foreach($k in _Keys($Obj?.ObjectHosts)){ if($k -match $serverHint){ [void]$serverNames.Add($k) } }
+  foreach($k in _Keys($Obj?.ObjectSubnets)){ if($k -match $serverHint){ [void]$serverNames.Add($k) } }
+  foreach($k in _Keys($Obj?.GroupHosts)){ if($k -match $serverHint){ [void]$serverNames.Add($k) } }
+  foreach($k in _Keys($Obj?.GroupSubnets)){ if($k -match $serverHint){ [void]$serverNames.Add($k) } }
+
+  $entries = New-Object System.Collections.Generic.List[object]
+
+  function _NewEntry {
+    param(
+      [string]$sourceName,
+      [string]$sourceType,
+      [string]$natKind,
+      [string]$natMode,
+      [string]$srcIf,
+      [string]$dstIf,
+      [string]$natTarget,
+      [string]$natLine,
+      [bool]$identity,
+      [bool]$routeLookup,
+      [bool]$policyNat,
+      [string]$policyTarget
+    )
+
+    $entry = [PSCustomObject]@{
+      SourceName        = $sourceName
+      SourceType        = $sourceType
+      SourceAliases     = [System.Collections.Generic.List[string]]::new()
+      SourceIps         = [System.Collections.Generic.List[string]]::new()
+      SourceSubnets     = [System.Collections.Generic.List[string]]::new()
+      SrcInterface      = $srcIf
+      DstInterface      = $dstIf
+      NatKind           = $natKind
+      NatMode           = $natMode
+      NatTarget         = $natTarget.Trim()
+      NatLine           = $natLine.Trim()
+      IdentityNat       = $identity
+      RouteLookup       = $routeLookup
+      PolicyNat         = $policyNat
+      PolicyTarget      = if($policyTarget){ $policyTarget.Trim() } else { '' }
+      AclWideLines      = [System.Collections.Generic.List[string]]::new()
+      AclRestrictedLines= [System.Collections.Generic.List[string]]::new()
+      AclMatches        = [System.Collections.Generic.List[string]]::new()
+      IsServerCandidate = $false
+      HasInternetAccess = $false
+      ExposureLevel     = 'None'
+    }
+    _AddUnique $entry.SourceAliases $sourceName
+    return $entry
+  }
+
+  function _PopulateAddresses($entry,$Obj,$name){
+    if(-not $entry){ return }
+    if([string]::IsNullOrWhiteSpace($name)){ return }
+    foreach($ip in _CollectHosts $Obj $name){ _AddUnique $entry.SourceIps $ip }
+    foreach($sn in _CollectSubnets $Obj $name){ _AddUnique $entry.SourceSubnets $sn }
+  }
+
+  $currentObj = $null
+  for($i=0;$i -lt $lines.Count;$i++){
+    $line = $lines[$i]
+    if($line -match '^\s*object\s+network\s+(\S+)'){
+      $currentObj = $matches[1]
+      continue
+    }
+
+    if($currentObj){
+      if($line -match '^\s*nat\s*\((?<src>\S+)\s*,\s*(?<dst>\S+)\)\s*(?<where>after-auto|manual)?\s*(?<type>dynamic|static|identity)\s+(?<target>[^\s]+)(?<tail>.*)$'){
+        $dstIf = $matches['dst']
+        if($dstIf -match '^(?i)outside'){
+          $srcIf = $matches['src']
+          $natMode = $matches['type']
+          $target = ($matches['target'] + $matches['tail']).Trim()
+          $routeLookup = $matches['tail'] -match '\broute-lookup\b'
+          $entry = _NewEntry -sourceName $currentObj -sourceType 'object' -natKind 'object' -natMode $natMode -srcIf $srcIf -dstIf $dstIf -natTarget $target -natLine $line -identity ($natMode -eq 'identity') -routeLookup $routeLookup -policyNat:$false -policyTarget ''
+          _PopulateAddresses $entry $Obj $currentObj
+          $entry.IsServerCandidate = $serverNames.Contains($currentObj) -or ($currentObj -match '(?i)dmz|srv|server|app|web|sql|rdp|ts|bastion|proxy')
+          if(-not $entry.IsServerCandidate -and ($entry.SourceIps | Where-Object { _IsRFC1918 $_ }).Count -gt 0){ $entry.IsServerCandidate = $true }
+          [void]$entries.Add($entry)
+        }
+      }
+      if($line -notmatch '^\s+'){
+        $currentObj = $null
+      }
+      continue
+    }
+
+    if($line -match '^\s*nat\s*\((?<srcif>\S+)\s*,\s*(?<dstif>\S+)\)\s*(?<where>after-auto|manual)?\s+source\s+(?<stype>dynamic|static|identity)\s+(?<sobj>(object-group|object)\s+\S+|\S+)(?<rest>.*)$'){
+      if($matches['dstif'] -notmatch '^(?i)outside'){ continue }
+      $srcIf = $matches['srcif']
+      $dstIf = $matches['dstif']
+      $natMode = $matches['stype']
+      $sourceExpr = $matches['sobj']
+      $rest = $matches['rest']
+      $sourceName = _NameFromRef $sourceExpr
+      $sourceType = 'literal'
+      if($sourceExpr -match '^object-group\s+') { $sourceType = 'object-group' }
+      elseif($sourceExpr -match '^object\s+') { $sourceType = 'object' }
+      elseif($sourceExpr -match '^interface$') { $sourceType = 'interface' }
+      $routeLookup = $rest -match '\broute-lookup\b'
+      $policyTarget = ''
+      $policyNat = $false
+      if($rest -match '\bdestination\s+(?<dtype>static|dynamic)\s+(?<dobj>(object-group|object)\s+\S+|\S+)'){ $policyNat = $true; $policyTarget = $matches['dobj'] }
+      $entry = _NewEntry -sourceName $sourceName -sourceType $sourceType -natKind 'manual' -natMode $natMode -srcIf $srcIf -dstIf $dstIf -natTarget $rest -natLine $line -identity ($natMode -eq 'identity') -routeLookup $routeLookup -policyNat:$policyNat -policyTarget $policyTarget
+      if($sourceType -eq 'object' -or $sourceType -eq 'object-group'){
+        _PopulateAddresses $entry $Obj $sourceName
+      } elseif($sourceExpr -match '\b(\d{1,3}(?:\.\d{1,3}){3})\b\s+(\d{1,3}(?:\.\d{1,3}){3})'){ _AddUnique $entry.SourceSubnets ($matches[1] + ' ' + $matches[2]) }
+      elseif($sourceExpr -match '\b(\d{1,3}(?:\.\d{1,3}){3})\b'){ _AddUnique $entry.SourceIps $matches[1] }
+      $entry.IsServerCandidate = $serverNames.Contains($sourceName) -or ($sourceName -match '(?i)dmz|srv|server|app|web|sql|rdp|ts|bastion|proxy')
+      if(-not $entry.IsServerCandidate -and ($entry.SourceIps | Where-Object { _IsRFC1918 $_ }).Count -gt 0){ $entry.IsServerCandidate = $true }
+      [void]$entries.Add($entry)
+    }
+  }
+
+  if($entries.Count -eq 0){
+    $script:ServerNatMapCache = @()
+    return $script:ServerNatMapCache
+  }
+
+  $bindMap = Get-AclBindingMap -Cfg $Cfg
+  $aclParsed = New-Object System.Collections.Generic.List[object]
+  foreach($aclLine in _Idx $Cfg 'access-list'){
+    $parsed = Parse-AclLine -Line $aclLine
+    if(-not $parsed -or $parsed.Action -ne 'permit'){ continue }
+    $annot = $aclLine
+    if($bindMap.ContainsKey($parsed.Name)){
+      $annot = $annot + '  ' + (($bindMap[$parsed.Name] | ForEach-Object { "[{0} {1}]" -f $_.Interface,$_.Direction }) -join ' ')
+    } else {
+      $annot = $annot + '  [UNBOUND]'
+    }
+    $parsed | Add-Member -NotePropertyName Annotated -NotePropertyValue $annot -Force
+    $aclParsed.Add($parsed) | Out-Null
+  }
+
+  function __IsWideService([string]$svc){
+    if([string]::IsNullOrWhiteSpace($svc)){ return $true }
+    if($svc -match '^\s*ip\s*$'){ return $true }
+    if($svc -match '\brange\s+\d+\s+\d+\b'){ return $true }
+    if($svc -match '\b(eq|lt|gt)\s+\d+\b'){ return $false }
+    return $false
+  }
+
+  foreach($entry in $entries){
+    foreach($alias in @($entry.SourceName)){
+      _AddUnique $entry.SourceAliases $alias
+    }
+    foreach($acl in $aclParsed){
+      $match = $false
+      switch($acl.SrcType){
+        'object' {
+          if($entry.SourceAliases.Contains($acl.Src)){ $match = $true }
+          elseif(($entry.SourceIps.Count -gt 0) -and (_CollectHosts $Obj $acl.Src | Where-Object { $entry.SourceIps.Contains($_) }).Count -gt 0){ $match = $true }
+          elseif((_CollectSubnets $Obj $acl.Src | Where-Object { $entry.SourceSubnets.Contains($_) }).Count -gt 0){ $match = $true }
+        }
+        'og' {
+          if($entry.SourceAliases.Contains($acl.Src)){ $match = $true }
+          elseif((_CollectHosts $Obj $acl.Src | Where-Object { $entry.SourceIps.Contains($_) }).Count -gt 0){ $match = $true }
+          elseif((_CollectSubnets $Obj $acl.Src | Where-Object { $entry.SourceSubnets.Contains($_) }).Count -gt 0){ $match = $true }
+        }
+        'host' {
+          if($entry.SourceIps.Contains($acl.Src)){ $match = $true }
+        }
+        'subnet' {
+          if($entry.SourceSubnets.Contains($acl.Src)){ $match = $true }
+        }
+      }
+      if(-not $match){ continue }
+
+      $destAny = ($acl.DstType -eq 'any') -or ($acl.DstType -eq 'subnet' -and $acl.Dst -match '^0\.0\.0\.0\s+0\.0\.0\.0$')
+      $hasPort = $acl.Service -match '\b(eq|lt|gt|range)\s+\d+'
+      $destPublic = $false
+      if($acl.DstType -eq 'host'){
+        $destPublic = -not (_IsRFC1918 $acl.Dst)
+      } elseif($acl.DstType -eq 'subnet'){
+        $parts = $acl.Dst -split '\s+'
+        if($parts.Count -gt 0){ $destPublic = -not (_IsRFC1918 $parts[0]) }
+      }
+
+      $wideSvc = __IsWideService $acl.Service
+
+      _AddUnique $entry.AclMatches $acl.Annotated
+      if($destAny -and ($wideSvc -or ($acl.Proto -match '^(?i)ip$') -or -not $hasPort)){
+        _AddUnique $entry.AclWideLines $acl.Annotated
+      } elseif($destAny){
+        _AddUnique $entry.AclRestrictedLines $acl.Annotated
+      } elseif($destPublic -and ($wideSvc -or -not $hasPort)){
+        _AddUnique $entry.AclWideLines $acl.Annotated
+      } else {
+        _AddUnique $entry.AclRestrictedLines $acl.Annotated
+      }
+    }
+
+    if($entry.AclWideLines.Count -gt 0){
+      $entry.HasInternetAccess = $true
+      $entry.ExposureLevel = 'Wide'
+    } elseif($entry.AclRestrictedLines.Count -gt 0){
+      $entry.HasInternetAccess = $true
+      $entry.ExposureLevel = 'Restricted'
+    }
+  }
+
+  $script:ServerNatMapCache = @(
+    foreach($entry in $entries){
+      [PSCustomObject]@{
+        SourceName        = $entry.SourceName
+        SourceType        = $entry.SourceType
+        SourceAliases     = @($entry.SourceAliases)
+        SourceIps         = @($entry.SourceIps | Sort-Object -Unique)
+        SourceSubnets     = @($entry.SourceSubnets | Sort-Object -Unique)
+        SrcInterface      = $entry.SrcInterface
+        DstInterface      = $entry.DstInterface
+        NatKind           = $entry.NatKind
+        NatMode           = $entry.NatMode
+        NatTarget         = $entry.NatTarget
+        NatLine           = $entry.NatLine
+        IdentityNat       = $entry.IdentityNat
+        RouteLookup       = $entry.RouteLookup
+        PolicyNat         = $entry.PolicyNat
+        PolicyTarget      = $entry.PolicyTarget
+        HasInternetAccess = $entry.HasInternetAccess
+        ExposureLevel     = $entry.ExposureLevel
+        AclWide           = @($entry.AclWideLines)
+        AclRestricted     = @($entry.AclRestrictedLines)
+        AclMatches        = @($entry.AclMatches)
+        IsServerCandidate = $entry.IsServerCandidate
+      }
+    }
+  )
+
+  return $script:ServerNatMapCache
+}
+
 function Write-AsaReport {
   param(
     [PSCustomObject[]]$Findings,
@@ -300,7 +657,11 @@ function Write-AsaReport {
   )
 
   # Консоль + JSON
-  $sorted = $Findings | Sort-Object @{Expression='Passed';Descending=$true}, @{Expression='Severity';Descending=$true}, 'Id'
+  $severityWeight = @{ High = 0; Medium = 1; Low = 2; Info = 3 }
+  $sorted = $Findings | Sort-Object 
+    @{Expression={ if($_.Passed){ 1 } else { 0 } }},
+    @{Expression={ if($severityWeight.ContainsKey($_.Severity)){ $severityWeight[$_.Severity] } else { 9 } }},
+    'Id'
   foreach($f in $sorted){
     $state = if($f.Passed){ '[OK]' } else { '[ISSUE]' }
     $color = if($f.Passed){ 'Green' } elseif($f.Severity -eq 'High'){'Red'} elseif($f.Severity -eq 'Medium'){'Yellow'} else {'Cyan'}
@@ -360,15 +721,43 @@ function Build-AsaObjects {
       for($j=$i+1; $j -lt $lines.Count -and $lines[$j] -notmatch '^\s*object-group\s+(network|service)\b'; $j++){
         if($lines[$j] -match '^\s*network-object\s+host\s+(\d{1,3}(?:\.\d{1,3}){3})'){ [void]$groupHosts[$g].Add($matches[1]) }
         elseif($lines[$j] -match '^\s*network-object\s+object\s+(\S+)'){ [void]$groupRefs[$g].Add($matches[1]) }
+        elseif($lines[$j] -match '^\s*group-object\s+(\S+)'){ [void]$groupRefs[$g].Add($matches[1]) }
         elseif($lines[$j] -match '^\s*network-object\s+(\d{1,3}(?:\.\d{1,3}){3})\s+(\d{1,3}(?:\.\d{1,3}){3})'){ [void]$groupSubnets[$g].Add("$($matches[1]) $($matches[2])") }
       }
     }
   }
-  foreach($g in $groupRefs.Keys){
-    foreach($obj in $groupRefs[$g]){
-      if($objectHosts.ContainsKey($obj)){ foreach($ip in $objectHosts[$obj]){ [void]$groupHosts[$g].Add($ip) } }
-      if($objectSubnets.ContainsKey($obj)){ foreach($sn in $objectSubnets[$obj]){ [void]$groupSubnets[$g].Add($sn) } }
+  $resolveGroup = {
+    param(
+      [string]$GroupName,
+      [System.Collections.Generic.HashSet[string]]$Visited
+    )
+
+    if(-not $groupRefs.ContainsKey($GroupName)){ return }
+    if(-not $Visited.Add($GroupName)){ return }
+
+    foreach($ref in $groupRefs[$GroupName]){
+      if($objectHosts.ContainsKey($ref)){
+        foreach($ip in $objectHosts[$ref]){ [void]$groupHosts[$GroupName].Add($ip) }
+      }
+      if($objectSubnets.ContainsKey($ref)){
+        foreach($sn in $objectSubnets[$ref]){ [void]$groupSubnets[$GroupName].Add($sn) }
+      }
+      if($groupRefs.ContainsKey($ref)){
+        & $resolveGroup $ref $Visited
+        if($groupHosts.ContainsKey($ref)){
+          foreach($ip in $groupHosts[$ref]){ [void]$groupHosts[$GroupName].Add($ip) }
+        }
+        if($groupSubnets.ContainsKey($ref)){
+          foreach($sn in $groupSubnets[$ref]){ [void]$groupSubnets[$GroupName].Add($sn) }
+        }
+      }
     }
+
+    [void]$Visited.Remove($GroupName)
+  }
+
+  foreach($g in $groupRefs.Keys){
+    & $resolveGroup $g ([System.Collections.Generic.HashSet[string]]::new())
   }
   [PSCustomObject]@{ ObjectHosts=$objectHosts; ObjectSubnets=$objectSubnets; GroupHosts=$groupHosts; GroupSubnets=$groupSubnets }
 }
@@ -455,19 +844,8 @@ function Check-ACLAnyAny {
   param($Cfg)
 
   $acls   = @(); if($Cfg.Index.Contains('access-list')){ $acls = $Cfg.Index['access-list'] }
-  $groups = @(); if($Cfg.Index.Contains('access-group')){ $groups = $Cfg.Index['access-group'] }
 
-  # Map: ACL Name -> list of {Direction, Interface|global}
-  $bindMap = @{}
-  foreach($g in $groups){
-    $m = [regex]::Match($g,'^\s*access-group\s+(?<name>\S+)\s+(?<dir>in|out)\s+(?:interface\s+(?<if>\S+)|global)\s*$', 'IgnoreCase')
-    if($m.Success){
-      $n = $m.Groups['name'].Value
-      if(-not $bindMap.ContainsKey($n)){ $bindMap[$n] = New-Object System.Collections.Generic.List[object] }
-      $ifc = if($m.Groups['if'].Success){ $m.Groups['if'].Value } else { 'global' }
-      [void]$bindMap[$n].Add([PSCustomObject]@{ Direction=$m.Groups['dir'].Value; Interface=$ifc })
-    }
-  }
+  $bindMap = Get-AclBindingMap -Cfg $Cfg
 
   $hits = @($acls | Where-Object { $_ -match '\bpermit\s+ip\s+any\s+any\b' })
   if(-not $hits -or $hits.Count -eq 0){
@@ -481,8 +859,8 @@ function Check-ACLAnyAny {
     $annot = $ln
     if($m.Success){
       $name = $m.Groups['name'].Value
-      if($bindMap.ContainsKey($name)){
-        $bindsTxt = ($bindMap[$name] | ForEach-Object { "[{0} {1}]" -f $_.Interface,$_.Direction }) -join ' '
+    if($bindMap.ContainsKey($name)){
+      $bindsTxt = ($bindMap[$name] | ForEach-Object { "[{0} {1}]" -f $_.Interface,$_.Direction }) -join ' '
         $annot = "$ln  $bindsTxt"
         if(($bindMap[$name] | Where-Object { $_.Interface -match '^outside$' -and $_.Direction -eq 'in' }).Count -gt 0){
           $outsideIn = $true
@@ -538,18 +916,7 @@ function Check-ACLForServers {
   # --- строки ACL + карта привязок (name -> [ {Interface,Direction}... ]) ---
   $aclLines = @(); if($Cfg.Index.Contains('access-list')){ $aclLines = $Cfg.Index['access-list'] }
 
-  $bindMap = @{}
-  if($Cfg.Index.Contains('access-group')){
-    foreach($g in $Cfg.Index['access-group']){
-      $m = [regex]::Match($g,'^\s*access-group\s+(?<name>\S+)\s+(?<dir>in|out)\s+(?:interface\s+(?<if>\S+)|global)\s*$', 'IgnoreCase')
-      if($m.Success){
-        $n = $m.Groups['name'].Value
-        if(-not $bindMap.ContainsKey($n)){ $bindMap[$n] = New-Object System.Collections.Generic.List[object] }
-        $ifc = if($m.Groups['if'].Success){ $m.Groups['if'].Value } else { 'global' }
-        [void]$bindMap[$n].Add([PSCustomObject]@{ Interface=$ifc; Direction=$m.Groups['dir'].Value })
-      }
-    }
-  }
+  $bindMap = Get-AclBindingMap -Cfg $Cfg
 
   # --- накопители находок по направлениям ---
   $evAnyToSrv = New-Object System.Collections.Generic.List[string]  # any -> server (экспозиция)
@@ -642,10 +1009,11 @@ function Check-ACLRedundancy {
   $shadowed   = [System.Collections.Generic.List[string]]::new()
   $anyAnyAfter= [System.Collections.Generic.List[string]]::new()
 
+  $bindingMap = Get-AclBindingMap -Cfg $Cfg
   $boundNames = @()
-  if($Cfg.Index.Contains('access-group')){
-    foreach($ag in $Cfg.Index['access-group']){
-      if($ag -match '^\s*access-group\s+(\S+)\s+in\s+interface\s+\S+'){ $boundNames += $matches[1] }
+  foreach($name in $bindingMap.Keys){
+    if(($bindingMap[$name] | Where-Object { $_.Direction -eq 'in' -and $_.Interface -ne 'global' }).Count -gt 0){
+      $boundNames += $name
     }
   }
   $boundNames = $boundNames | Select-Object -Unique
@@ -1439,20 +1807,6 @@ function Check-DMZtoInsideDeep {
     if($ip -match '^172\.(1[6-9]|2\d|3[0-1])\.') { return $true }
     return $false
   }
-  function __BindMap($Cfg){
-    $map=@{}
-    foreach($g in (__GetIndexLines $Cfg 'access-group')){
-      $m=[regex]::Match($g,'^\s*access-group\s+(?<name>\S+)\s+(?<dir>in|out)\s+(?:interface\s+(?<if>\S+)|global)\s*$', 'IgnoreCase')
-      if($m.Success){
-        $n=$m.Groups['name'].Value
-        if(-not $map.ContainsKey($n)){ $map[$n]=New-Object System.Collections.Generic.List[object] }
-        $ifc= if($m.Groups['if'].Success){ $m.Groups['if'].Value } else { 'global' }
-        [void]$map[$n].Add([PSCustomObject]@{ Interface=$ifc; Direction=$m.Groups['dir'].Value })
-      }
-    }
-    $map
-  }
-
   # --- вход ---
   $lines = __Enum($Cfg?.Lines)
   if($lines.Count -eq 0){
@@ -1483,8 +1837,24 @@ function Check-DMZtoInsideDeep {
   foreach($n in __Enum($nameifs.Values)){ if($n -match '^(?i)(inside|internal|corp|intranet|lan|pci)$'){ [void]$insideIfSet.Add($n) } }
   if($insideIfSet.Count -eq 0){ [void]$insideIfSet.Add('inside') } # эвристика
 
+  # --- имена объектов (для более точных проверок) ---
+  $dmzNameSet    = __NewSet
+  $insideNameSet = __NewSet
+  $dmzNameRx     = '(?i)\b(dmz|guest|partner|online|public|ext|external)\b'
+  $insideNameRx  = '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'
+
+  foreach($k in __Keys($Obj?.ObjectHosts))   { if($k -match $dmzNameRx)    { [void]$dmzNameSet.Add($k)    } }
+  foreach($k in __Keys($Obj?.ObjectSubnets)) { if($k -match $dmzNameRx)    { [void]$dmzNameSet.Add($k)    } }
+  foreach($k in __Keys($Obj?.GroupHosts))    { if($k -match $dmzNameRx)    { [void]$dmzNameSet.Add($k)    } }
+  foreach($k in __Keys($Obj?.GroupSubnets))  { if($k -match $dmzNameRx)    { [void]$dmzNameSet.Add($k)    } }
+
+  foreach($k in __Keys($Obj?.ObjectHosts))   { if($k -match $insideNameRx) { [void]$insideNameSet.Add($k) } }
+  foreach($k in __Keys($Obj?.ObjectSubnets)) { if($k -match $insideNameRx) { [void]$insideNameSet.Add($k) } }
+  foreach($k in __Keys($Obj?.GroupHosts))    { if($k -match $insideNameRx) { [void]$insideNameSet.Add($k) } }
+  foreach($k in __Keys($Obj?.GroupSubnets))  { if($k -match $insideNameRx) { [void]$insideNameSet.Add($k) } }
+
   # --- карта привязок ACL ---
-  $bindMap = __BindMap $Cfg
+  $bindMap = Get-AclBindingMap -Cfg $Cfg
 
   # Если на DMZ-подобных интерфейсах нет привязанных ACL — отдельное замечание
   $dmzBound = @()
@@ -1530,25 +1900,31 @@ function Check-DMZtoInsideDeep {
 
     # аннотация привязки
     $bindTxt = '  [UNBOUND]'
+    $boundDmzIn = $false
     if($p.Name -and $bindMap -and $bindMap.ContainsKey($p.Name)){
-      $bindTxt = '  ' + ((__Enum $bindMap[$p.Name]) | ForEach-Object { "[{0} {1}]" -f $_.Interface,$_.Direction } -join ' ')
+      $bindDetails = __Enum $bindMap[$p.Name]
+      if($bindDetails.Count -gt 0){
+        $bindTxt = '  ' + ($bindDetails | ForEach-Object { "[{0} {1}]" -f $_.Interface,$_.Direction } -join ' ')
+        foreach($bind in $bindDetails){
+          if($dmzIfSet.Contains($bind.Interface) -and $bind.Direction -eq 'in'){
+            $boundDmzIn = $true
+            break
+          }
+        }
+      }
     }
 
     # источник DMZ?
-    $isDmzSrc =
-      (($p.SrcType -in @('object','og')) -and $p.Src -and $dmzIfSet.Any({ $p.Name -match ('(?i)^{0}$' -f [regex]::Escape($_)) }) -or $dmzNameSet.Contains($p.Src)) -or
-      ($p.SrcType -eq 'subnet' -and $p.Src -match '^172\.(1[6-9]|2\d|3[01])\.' -and $p.Name -and $p.Name -match '(?i)dmz') -or
-      ($p.SrcType -eq 'host'   -and $p.Name -and $p.Name -match '(?i)dmz')
-
-    # назначение INSIDE?
-    if(-not (Get-Variable insideNameSet -Scope Local -ErrorAction SilentlyContinue)){
-      $insideNameSet = __NewSet
-      foreach($k in __Keys($Obj?.ObjectHosts)){ if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ $insideNameSet.Add($k) | Out-Null } }
-      foreach($k in __Keys($Obj?.ObjectSubnets)){ if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ $insideNameSet.Add($k) | Out-Null } }
-      foreach($k in __Keys($Obj?.GroupHosts)){ if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ $insideNameSet.Add($k) | Out-Null } }
-      foreach($k in __Keys($Obj?.GroupSubnets)){ if($k -match '(?i)\b(inside|internal|corp|intranet|lan|pci)\b'){ $insideNameSet.Add($k) | Out-Null } }
+    $aclLooksDmz = ($p.Name -and $p.Name -match '(?i)(dmz|guest|partner|online|public)')
+    $isDmzSrc = $boundDmzIn
+    if(-not $isDmzSrc -and $p.SrcType -in @('object','og') -and $p.Src){
+      if($dmzNameSet.Contains($p.Src)){ $isDmzSrc = $true }
+    }
+    if(-not $isDmzSrc -and $aclLooksDmz){
+      if($p.SrcType -in @('subnet','host','any')){ $isDmzSrc = $true }
     }
 
+    # назначение INSIDE?
     $isInsideDst =
       (($p.DstType -in @('object','og')) -and $p.Dst -and $insideNameSet.Contains($p.Dst)) -or
       ($p.DstType -eq 'subnet' -and $p.Dst -and ($p.Dst -match '^\d{1,3}(?:\.\d{1,3}){3}\s+\d{1,3}(?:\.\d{1,3}){3}$' -and (__IsRFC1918 ($p.Dst -split '\s+')[0])) ) -or
@@ -1894,6 +2270,17 @@ try {
                   -Html:$Html `
                   -HtmlPath $HtmlPath `
                   -Lang $Lang
+
+  if(-not [string]::IsNullOrWhiteSpace($NatMapPath)){
+    $natMapData = Get-ServerNatMap -Cfg $cfg -Obj $obj
+    try {
+      $natMapData | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 -Path $NatMapPath
+      Write-Host "NAT map saved: $NatMapPath" -ForegroundColor Cyan
+    }
+    catch {
+      Write-Warning ("Failed to save NAT map to {0}: {1}" -f $NatMapPath, $_.Exception.Message)
+    }
+  }
 }
 catch {
   Write-Error ("Audit error: {0}" -f $_.Exception.Message)
