@@ -87,17 +87,22 @@ function Resolve-Includes {
 
     $toks = $text -split '\s+'
     if(($toks.Count -ge 2) -and ($toks[0].ToLower() -eq 'include')){
-      # поддерживаем include с шаблонами: include conf.d\*.conf
+      # поддерживаем шаблоны: include conf.d\*.conf (без Get-ChildItem)
       $pattern = $toks[1]
-      if(-not [System.IO.Path]::IsPathRooted($pattern)){ $pattern = Join-Path -Path $baseDir -ChildPath $pattern }
+      if(-not [System.IO.Path]::IsPathRooted($pattern)){
+        $pattern = Join-Path -Path $baseDir -ChildPath $pattern
+      }
 
       $dir  = Split-Path -Parent $pattern
       $mask = Split-Path -Leaf   $pattern
 
+      if([string]::IsNullOrWhiteSpace($dir)){ $dir = $baseDir }
       if(Test-Path -Path $dir){
-        $matches = Get-ChildItem -Path $dir -Filter $mask -File -ErrorAction SilentlyContinue
-        foreach($m in $matches){
-          $nested = Resolve-Includes -BaseFile $m.FullName -Visited $Visited
+        try {
+          $files = [System.IO.Directory]::GetFiles($dir, $mask, [System.IO.SearchOption]::TopDirectoryOnly)
+        } catch { $files = @() }
+        foreach($f in $files){
+          $nested = Resolve-Includes -BaseFile $f -Visited $Visited
           foreach($n in $nested){ $recs.Add($n) }
         }
       }
@@ -109,6 +114,7 @@ function Resolve-Includes {
 
   return ,$recs
 }
+
 #endregion
 
 #region Parse
