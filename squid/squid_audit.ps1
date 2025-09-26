@@ -314,6 +314,10 @@ function Run-SquidChecks {
   $extra = Run-ExtraChecks -Model $Model
   foreach($f in $extra){ $find.Add($f) }
 
+    # 11) Добавляем «OK»-находки
+  $oks = Add-OkFindings -Model $Model
+  foreach($o in $oks){ $find.Add($o) }
+
   return ,$find
 }
 
@@ -495,17 +499,35 @@ function Run-ExtraChecks {
 #----------------------------- Вывод -----------------------------
 function Write-Table {
   param([System.Collections.Generic.List[Finding]]$Findings)
-  if(-not $Findings -or $Findings.Count -eq 0){ Write-Host "✔ Проблем не обнаружено."; return }
-  "{0,-4}  {1,-22}  {2,-6}  {3}" -f 'SEV','ID','LINE','MESSAGE'
-  ('-'*100)
+
+  if(-not $Findings -or $Findings.Count -eq 0){
+    Write-Host "✔ Проблем не обнаружено." -ForegroundColor Green
+    return
+  }
+
+  $header = ("{0,-4}  {1,-22}  {2,-6}  {3}" -f 'SEV','ID','LINE','MESSAGE')
+  Write-Host $header -ForegroundColor Gray
+  Write-Host ('-'*100) -ForegroundColor Gray
+
   foreach($x in $Findings){
+    $lineNum = ($(if($null -ne $x.Line){$x.Line}else{'-'}))
+    $msg = "{0,-4}  {1,-22}  {2,-6}  {3}" -f $x.Severity, $x.Id, $lineNum, $x.Message
+
+    switch -Regex ($x.Severity) {
+      '^OK$'   { Write-Host $msg -ForegroundColor Green; break }
+      '^LOW$'  { Write-Host $msg -ForegroundColor Yellow; break }
+      '^MED$'  { Write-Host $msg -ForegroundColor DarkYellow; break }
+      '^HIGH$' { Write-Host $msg -ForegroundColor Red; break }
+      default  { Write-Host $msg -ForegroundColor Gray }
+    }
+
     $loc = $x.File; if($null -ne $x.Line){ $loc = "$($x.File):$($x.Line)" }
-    "{0,-4}  {1,-22}  {2,-6}  {3}" -f $x.Severity, $x.Id, ($(if($null -ne $x.Line){$x.Line}else{'-'})), $x.Message
-    "  ↳ at: {0}" -f $loc
-    "  ↳ evidence: {0}" -f $x.Evidence
-    "  ↳ fix: {0}" -f $x.Recommendation
+    Write-Host ("  ↳ at: {0}" -f $loc) -ForegroundColor Gray
+    Write-Host ("  ↳ evidence: {0}" -f $x.Evidence) -ForegroundColor DarkGray
+    Write-Host ("  ↳ fix: {0}" -f $x.Recommendation) -ForegroundColor DarkGray
   }
 }
+
 function Out-Json {
   param([System.Collections.Generic.List[Finding]]$Findings)
   $rows = @()
@@ -517,6 +539,107 @@ function Out-Json {
   }
   $rows | ConvertTo-Json -Depth 4
 }
+
+function Add-OkFindings {
+  param([Model]$Model)
+
+  $oks = New-Object System.Collections.Generic.List[Finding]
+
+  # A) Финальный http_access deny all
+  if($Model.HttpAccess.Count -gt 0){
+    $last = $Model.HttpAccess[$Model.HttpAccess.Count-1]
+    $termsLower = @(); foreach($t in $last.Terms){ $termsLower += $t.ToLower() }
+    if(($last.Action -eq 'deny') -and ($termsLower -contains 'all')){
+      $oks.Add([Finding]::new('SQ-DENY-ALL-PRESENT','OK',$last.Line,$last.File,
+        "Есть явное финальное 'http_access deny all' — это правильно.",
+        "Оставьте это правило последним.",
+        $last.Raw))
+    }
+  }
+
+  # B) Доступ к manager из localhost
+  foreach($rec in $Model.Records){
+    if([string]$rec.Text -match '^\s*http_access\s+allow\s+localhost\s+manager\b'){
+      $oks.Add([Finding]::new('SQ-MANAGER-LOCALHOST','OK',[int]$rec.Line,[string]$rec.File,
+        "Доступ к manager ограничен localhost.",
+        "Это безопасная настройка, менять не требуется.",
+        [string]$rec.Text))
+    }
+  }
+
+  # C) Надёжные tls_outgoing_options (>=1.2, без NO_TLSv1_2, без RC4/NULL/MD5)
+  foreach($rec in $Model.Records){
+    $txt = [string]$rec.Text
+    if($txt -match '^\s*tls_outgoing_options\s+'){
+      $good = $false
+      $min12 = ($txt -match 'min[-_ ]version\s*=\s*(1\.2|1\.3|tls1\.2|tls1\.3)')
+      $noBadOpt = ($txt -notmatch 'NO_TLSv1_2')
+      $noBadCiph = ($txt -notmatch 'cipher\s*=\s*.*(RC4|NULL|MD5)')
+      if($min12 -and $noBadOpt -and $noBadCiph){ $good = $true }
+      if($good){
+        $oks.Add([Finding]::new('SQ-TLS-OUT-STRONG','OK',[int]$rec.Line,[string]$rec.File,
+          "Параметры tls_outgoing_options выглядят безопасно (>= TLS 1.2, без слабых шифров/опций).",
+          "Оставьте как есть.",
+          $txt))
+      }
+    }
+  }
+
+  # D) Есть sslproxy_cafile
+  foreach($rec in $Model.Records){
+    if([string]$rec.Text -match '^\s*sslproxy_cafile\b'){
+      $oks.Add([Finding]::new('SQ-SSLPROXY-CAFILE-PRESENT','OK',[int]$rec.Line,[string]$rec.File,
+        "Указан sslproxy_cafile — цепочка серверных сертификатов будет проверяться.",
+        "Оставьте как есть, при необходимости используйте актуальные корни/промежуточные.",
+        [string]$rec.Text))
+    }
+  }
+
+  # E) CONNECT ограничен ssl_ports
+  foreach($r in $Model.HttpAccess){
+    if($r.Action -eq 'allow' -and ($r.Verbs -and ($r.Verbs -contains 'CONNECT'))){
+      $terms = @(); foreach($t in $r.Terms){ $terms += $t.ToLower().TrimStart('!') }
+      if($terms -contains 'ssl_ports'){
+        $oks.Add([Finding]::new('SQ-CONNECT-LOCKED','OK',$r.Line,$r.File,
+          "CONNECT ограничен ACL 'SSL_ports'.",
+          "Это хорошая практика.",
+          $r.Raw))
+      }
+    }
+  }
+
+  # F) Явные http_port без intercept/transparent/tproxy
+  foreach($p in $Model.HttpPorts){
+    $hasIntercept = $false
+    foreach($o in $p.Opts){ if(@('intercept','transparent','tproxy') -contains $o){ $hasIntercept=$true; break } }
+    if(-not $hasIntercept){
+      $oks.Add([Finding]::new('SQ-HTTPPORT-EXPLICIT','OK',[int]$p.Line,[string]$p.File,
+        "Порт $($p.Port) используется в явном режиме (без intercept/transparent).",
+        "Явная схема проксирования — безопаснее и предсказуемее.",
+        "http_port $($p.Port) $($p.Opts -join ' ')"))
+    }
+  }
+
+  # G) Используется аутентификация (proxy_auth) в разрешающих правилах
+  if($Model.AuthRequiredUsed){
+    # найдём первое allow с proxy_auth
+    foreach($r in $Model.HttpAccess){
+      if($r.Action -ne 'allow'){ continue }
+      $hasAuth = $false
+      foreach($t in $r.Terms){ if($t.ToLower().TrimStart('!') -eq 'proxy_auth'){ $hasAuth=$true; break } }
+      if($hasAuth){
+        $oks.Add([Finding]::new('SQ-AUTH-REQUIRED','OK',$r.Line,$r.File,
+          "В разрешающих правилах задействована аутентификация (proxy_auth).",
+          "Сохраняйте это правило, оно ограничивает доступ пользователями.",
+          $r.Raw))
+        break
+      }
+    }
+  }
+
+  return ,$oks
+}
+
 
 #----------------------------- CLI -----------------------------
 function Invoke-SquidAudit {
