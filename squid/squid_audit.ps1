@@ -1,10 +1,9 @@
-<#
+﻿<#
 .SYNOPSIS
   Аудит squid.conf на небезопасные правила (PowerShell 5+/7).
-
 .EXAMPLE
-  pwsh ./squid_audit.ps1 -Path ./squid.conf -Format Table
-  pwsh ./squid_audit.ps1 -Path ./squid.conf -Format Json > report.json
+  pwsh ./squid_audit.ps1 -Path /etc/squid/squid.conf -Format Table
+  pwsh ./squid_audit.ps1 -Path /etc/squid/squid.conf -Format Json > report.json
 #>
 
 [CmdletBinding()]
@@ -21,39 +20,44 @@ class Acl {
   [string]$Type
   [string[]]$Args
   [int]$Line
-  Acl([string]$n,[string]$t,[string[]]$a,[int]$l){ $this.Name=$n;$this.Type=$t;$this.Args=$a;$this.Line=$l }
+  [string]$File
+  Acl([string]$n,[string]$t,[string[]]$a,[int]$l,[string]$f){ $this.Name=$n;$this.Type=$t;$this.Args=$a;$this.Line=$l;$this.File=$f }
 }
 class HttpRule {
-  [string]$Action   # allow|deny
-  [string[]]$Verbs  # CONNECT/GET/...
-  [string[]]$Terms  # acl refs (может быть с !)
+  [string]$Action
+  [string[]]$Verbs
+  [string[]]$Terms
   [string]$Raw
   [int]$Line
-  HttpRule([string]$a,[string[]]$v,[string[]]$t,[string]$r,[int]$l){$this.Action=$a;$this.Verbs=$v;$this.Terms=$t;$this.Raw=$r;$this.Line=$l}
+  [string]$File
+  HttpRule([string]$a,[string[]]$v,[string[]]$t,[string]$r,[int]$l,[string]$f){$this.Action=$a;$this.Verbs=$v;$this.Terms=$t;$this.Raw=$r;$this.Line=$l;$this.File=$f}
 }
 class Model {
   [hashtable]$Acls = @{}
   [System.Collections.Generic.List[HttpRule]]$HttpAccess = [System.Collections.Generic.List[HttpRule]]::new()
+  [System.Collections.Generic.List[HttpRule]]$HttpReplyAccess = [System.Collections.Generic.List[HttpRule]]::new()
   [System.Collections.Generic.List[string]]$SafePorts = [System.Collections.Generic.List[string]]::new()
   [System.Collections.Generic.List[string]]$SslPorts  = [System.Collections.Generic.List[string]]::new()
-  [System.Collections.Generic.List[object]]$HttpPorts = [System.Collections.Generic.List[object]]::new() # @{Port=;Opts=;Line=}
-  [System.Collections.Generic.List[object]]$SslBump   = [System.Collections.Generic.List[object]]::new() # @{Raw=;Line=}
+  [System.Collections.Generic.List[object]]$HttpPorts = [System.Collections.Generic.List[object]]::new() # @{Port=;Opts=;Line=;File=}
+  [System.Collections.Generic.List[object]]$SslBump   = [System.Collections.Generic.List[object]]::new() # @{Raw=;Line=;File=}
+  [System.Collections.Generic.List[object]]$Records   = [System.Collections.Generic.List[object]]::new() # @{File=;Line=;Text=}
   [bool]$AuthRequiredUsed = $false
 }
 class Finding {
   [string]$Id
-  [string]$Severity  # HIGH|MED|LOW
+  [string]$Severity
   [Nullable[int]]$Line
+  [string]$File
   [string]$Message
   [string]$Recommendation
   [string]$Evidence
-  Finding([string]$id,[string]$sev,[Nullable[int]]$ln,[string]$msg,[string]$rec,[string]$ev){
-    $this.Id=$id;$this.Severity=$sev;$this.Line=$ln;$this.Message=$msg;$this.Recommendation=$rec;$this.Evidence=$ev
+  Finding([string]$id,[string]$sev,[Nullable[int]]$ln,[string]$file,[string]$msg,[string]$rec,[string]$ev){
+    $this.Id=$id;$this.Severity=$sev;$this.Line=$ln;$this.File=$file;$this.Message=$msg;$this.Recommendation=$rec;$this.Evidence=$ev
   }
 }
 #endregion
 
-#region Utils
+#region Utils: загрузка с учётом include
 function Load-Lines {
   param([string]$FilePath)
   if(!(Test-Path -LiteralPath $FilePath)){ throw "Файл не найден: $FilePath" }
@@ -83,82 +87,103 @@ function Load-Lines {
   return $out
 }
 
-function Split-Tokens {
-  param([string]$Text)
-  # простой split по whitespace
-  return ($Text -split '\s+')
-}
+function Resolve-Includes {
+  param([string]$BaseFile, [hashtable]$Visited)
 
-function Test-BroadCidr {
-  param([string]$Arg)
-  return @('0.0.0.0/0','::/0') -contains $Arg
-}
+  if(-not $Visited.ContainsKey($BaseFile)){ $Visited[$BaseFile]=$true } else { return @() }
 
-function Test-WideRange {
-  param([string[]]$Parts)
-  foreach($p in $Parts){
-    if($p -match '^\d{1,5}-\d{1,5}$'){
-      $lo,$hi = $p -split '-',2
-      $lo=[int]$lo; $hi=[int]$hi
-      if($lo -le 1 -and $hi -ge 65535){ return $true }
-      if(($hi-$lo) -ge 64000){ return $true }
-    } elseif($p -match '^\d{1,5}$'){
+  $baseDir = Split-Path -Parent -LiteralPath $BaseFile
+  $lines = Load-Lines -FilePath $BaseFile
+  $recs  = New-Object System.Collections.Generic.List[object]
+
+  foreach($rec in $lines){
+    $ln   = [int]$rec.Line
+    $text = [string]$rec.Text
+    if(-not $text){ continue }
+
+    $toks = $text -split '\s+'
+    if(($toks.Count -ge 2) -and ($toks[0].ToLower() -eq 'include')){
+      # поддерживаем шаблоны: include conf.d/*.conf
+      $pattern = $toks[1]
+      if(-not [System.IO.Path]::IsPathRooted($pattern)){ $pattern = Join-Path -Path $baseDir -ChildPath $pattern }
+      $dir = Split-Path -Parent $pattern
+      $mask = Split-Path -Leaf $pattern
+      if(Test-Path -LiteralPath $dir){
+        $matches = Get-ChildItem -LiteralPath $dir -Filter $mask -File -ErrorAction SilentlyContinue
+        foreach($m in $matches){
+          $recs.AddRange( (Resolve-Includes -BaseFile $m.FullName -Visited $Visited) )
+        }
+      }
       continue
     }
+
+    $recs.Add([pscustomobject]@{ File=$BaseFile; Line=$ln; Text=$text })
   }
-  return $false
+
+  return ,$recs
 }
 #endregion
 
 #region Parse
 function Parse-SquidConfig {
-  param($Lines)
+  param([string]$RootFile)
   $m = [Model]::new()
-  foreach($rec in $Lines){
+  $visited = @{}
+  $records = Resolve-Includes -BaseFile $RootFile -Visited $visited
+  foreach($r in $records){ $m.Records.Add($r) }
+
+  foreach($rec in $records){
     $ln = [int]$rec.Line
     $line = [string]$rec.Text
+    $file = [string]$rec.File
     if(-not $line){ continue }
-    $toks = Split-Tokens $line
+
+    $toks = $line -split '\s+'
     if(-not $toks){ continue }
     $head = $toks[0].ToLower()
+
     switch($head){
       'acl' {
         if($toks.Count -ge 3){
           $name = $toks[1]; $type = $toks[2]; $args = @()
           if($toks.Count -gt 3){ $args = $toks[3..($toks.Count-1)] }
-          $acl = [Acl]::new($name,$type,$args,$ln)
+          $acl = [Acl]::new($name,$type,$args,$ln,$file)
           $m.Acls[$name] = $acl
-          if($name.ToLower() -eq 'safe_ports'){ $m.SafePorts.AddRange($args) }
-          if($name.ToLower() -eq 'ssl_ports'){  $m.SslPorts.AddRange($args)  }
+          if($name.ToLower() -eq 'safe_ports'){ $m.SafePorts.AddRange([string[]]$args) }
+          if($name.ToLower() -eq 'ssl_ports'){  $m.SslPorts.AddRange([string[]]$args)  }
         }
       }
       'http_access' {
         if($toks.Count -ge 2){
           $action = $toks[1].ToLower()
-          $rest = @()
-          if($toks.Count -gt 2){ $rest = $toks[2..($toks.Count-1)] }
+          $rest = @(); if($toks.Count -gt 2){ $rest = $toks[2..($toks.Count-1)] }
           $verbs = @()
           if($rest.Count -gt 0 -and $rest[0] -match '^[A-Za-z]+$' -and @('CONNECT','GET','POST','PUT','DELETE','HEAD','OPTIONS','PATCH','TRACE') -contains $rest[0].ToUpper()){
-            $verbs = @($rest[0].ToUpper()); $rest = $rest[1..($rest.Count-1)]
+            $verbs = @($rest[0].ToUpper()); $rest = ($rest.Count -gt 1) ? $rest[1..($rest.Count-1)] : @()
           }
-          $rule = [HttpRule]::new($action,$verbs,$rest,$line,$ln)
+          $rule = [HttpRule]::new($action,$verbs,$rest,$line,$ln,$file)
           $m.HttpAccess.Add($rule)
           if($rest | ForEach-Object { $_.ToLower().TrimStart('!') } | Where-Object { $_ -eq 'proxy_auth' }){
             $m.AuthRequiredUsed = $true
           }
         }
       }
+      'http_reply_access' {
+        if($toks.Count -ge 2){
+          $action = $toks[1].ToLower()
+          $rest = @(); if($toks.Count -gt 2){ $rest = $toks[2..($toks.Count-1)] }
+          $rule = [HttpRule]::new($action,@(),$rest,$line,$ln,$file)
+          $m.HttpReplyAccess.Add($rule)
+        }
+      }
       'http_port' {
         if($toks.Count -ge 2){
           $port = $toks[1]
-          $opts = @()
-          if($toks.Count -gt 2){ $opts = $toks[2..($toks.Count-1)] | ForEach-Object { $_.ToLower() } }
-          $m.HttpPorts.Add(@{ Port=$port; Opts=$opts; Line=$ln })
+          $opts = @(); if($toks.Count -gt 2){ $opts = $toks[2..($toks.Count-1)] | ForEach-Object { $_.ToLower() } }
+          $m.HttpPorts.Add(@{ Port=$port; Opts=$opts; Line=$ln; File=$file })
         }
       }
-      'ssl_bump' {
-        $m.SslBump.Add(@{ Raw=$line; Line=$ln })
-      }
+      'ssl_bump' { $m.SslBump.Add(@{ Raw=$line; Line=$ln; File=$file }) }
       default { }
     }
   }
@@ -166,7 +191,7 @@ function Parse-SquidConfig {
 }
 #endregion
 
-#region Checks
+#region Checks (основные + расширенные)
 function Run-SquidChecks {
   param([Model]$Model)
   $find = New-Object System.Collections.Generic.List[Finding]
@@ -175,23 +200,27 @@ function Run-SquidChecks {
   foreach($r in $Model.HttpAccess){
     if($r.Action -eq 'allow'){
       if(-not $r.Terms -or $r.Terms.Count -eq 0){
-        $find.Add([Finding]::new('SQ-ALLOW-EMPTY','HIGH',$r.Line,'Разрешение без условий (http_access allow <пусто>)',
-          'Удалите правило или добавьте явные ACL; завершайте списком deny.',$r.Raw))
+        $find.Add([Finding]::new('SQ-ALLOW-EMPTY','HIGH',$r.Line,$r.File,
+          'Разрешение без условий (http_access allow <пусто>)',
+          'Удалите правило или добавьте явные ACL; завершайте списком deny.',
+          $r.Raw))
       }
       $termsLower = $r.Terms | ForEach-Object { $_.ToLower() }
       if($termsLower -contains 'all' -or $termsLower -contains 'any'){
-        $find.Add([Finding]::new('SQ-ALLOW-ALL','HIGH',$r.Line,'Широкое правило: http_access allow all/any',
-          'Сузьте до необходимых ACL и добавьте в конце "http_access deny all".',$r.Raw))
+        $find.Add([Finding]::new('SQ-ALLOW-ALL','HIGH',$r.Line,$r.File,
+          'Широкое правило: http_access allow all/any',
+          'Сузьте до необходимых ACL и добавьте в конце "http_access deny all".',
+          $r.Raw))
       }
     }
   }
 
-  # 2) Нет финального deny all
+  # 2) Нет финального deny all (http_access)
   if($Model.HttpAccess.Count -gt 0){
     $last = $Model.HttpAccess[$Model.HttpAccess.Count-1]
     $hasDenyAll = ($last.Action -eq 'deny') -and (($last.Terms | ForEach-Object { $_.ToLower() }) -contains 'all')
     if(-not $hasDenyAll){
-      $find.Add([Finding]::new('SQ-NO-DENY-ALL','MED',$null,
+      $find.Add([Finding]::new('SQ-NO-DENY-ALL','MED',$null,$last.File,
         "В конце списка правил нет явного 'http_access deny all'.",
         "Добавьте финальное правило 'http_access deny all' после всех allow/deny.",
         "Последняя строка: $($last.Raw) (line $($last.Line))"))
@@ -204,7 +233,7 @@ function Run-SquidChecks {
     if($r.Verbs -and ($r.Verbs -contains 'CONNECT')){
       $terms = $r.Terms | ForEach-Object { $_.ToLower().TrimStart('!') }
       if($terms -notcontains 'ssl_ports'){
-        $find.Add([Finding]::new('SQ-CONNECT-NO-SSL_PORTS','HIGH',$r.Line,
+        $find.Add([Finding]::new('SQ-CONNECT-NO-SSL_PORTS','HIGH',$r.Line,$r.File,
           "Разрешён CONNECT без ограничения ACL SSL_ports.",
           "Добавьте 'SSL_ports' в правило CONNECT или запретите CONNECT.",
           $r.Raw))
@@ -212,17 +241,19 @@ function Run-SquidChecks {
     }
   }
 
-  # 4) Широкие Safe_ports / SSL_ports
-  if((Test-WideRange -Parts $Model.SafePorts)){
-    $line = ($Model.Acls['safe_ports']).Line
-    $find.Add([Finding]::new('SQ-SAFE-PORTS-WIDE','MED',$line,
+  # 4) Широкие Safe_ports / SSL_ports (null-safe)
+  if($Model.SafePorts.Count -gt 0 -and (Test-WideRange -Parts $Model.SafePorts)){
+    $line=$null;$file=$null
+    if($Model.Acls.ContainsKey('safe_ports')){ $line=$Model.Acls['safe_ports'].Line; $file=$Model.Acls['safe_ports'].File }
+    $find.Add([Finding]::new('SQ-SAFE-PORTS-WIDE','MED',$line,$file,
       'ACL safe_ports содержит слишком широкий диапазон.',
       'Сузьте список до реально используемых портов.',
       ($Model.SafePorts -join ' ')))
   }
-  if((Test-WideRange -Parts $Model.SslPorts)){
-    $line = ($Model.Acls['ssl_ports']).Line
-    $find.Add([Finding]::new('SQ-SSL-PORTS-WIDE','MED',$line,
+  if($Model.SslPorts.Count -gt 0 -and (Test-WideRange -Parts $Model.SslPorts)){
+    $line=$null;$file=$null
+    if($Model.Acls.ContainsKey('ssl_ports')){ $line=$Model.Acls['ssl_ports'].Line; $file=$Model.Acls['ssl_ports'].File }
+    $find.Add([Finding]::new('SQ-SSL-PORTS-WIDE','MED',$line,$file,
       'ACL ssl_ports содержит слишком широкий диапазон.',
       'Оставьте только нужные TLS-порты (обычно 443/8443 и т.п.).',
       ($Model.SslPorts -join ' ')))
@@ -231,8 +262,8 @@ function Run-SquidChecks {
   # 5) Слишком широкие src ACL
   foreach($kv in $Model.Acls.GetEnumerator()){
     $acl = [Acl]$kv.Value
-    if($acl.Type.ToLower() -eq 'src' -and ($acl.Args | Where-Object { Test-BroadCidr $_ })){
-      $find.Add([Finding]::new('SQ-ACL-BROAD-SRC','MED',$acl.Line,
+    if($acl.Type.ToLower() -eq 'src' -and ($acl.Args | Where-Object { @('0.0.0.0/0','::/0') -contains $_ })){
+      $find.Add([Finding]::new('SQ-ACL-BROAD-SRC','MED',$acl.Line,$acl.File,
         "ACL '$($acl.Name)' (src) охватывает все сети.",
         'Сузьте ACL до необходимых внутренних подсетей.',
         "acl $($acl.Name) src $($acl.Args -join ' ')"))
@@ -242,7 +273,7 @@ function Run-SquidChecks {
   # 6) intercept/transparent порты
   foreach($p in $Model.HttpPorts){
     if(($p.Opts | Where-Object { @('intercept','transparent','tproxy') -contains $_ }).Count -gt 0){
-      $find.Add([Finding]::new('SQ-INTERCEPT','MED',[int]$p.Line,
+      $find.Add([Finding]::new('SQ-INTERCEPT','MED',[int]$p.Line,[string]$p.File,
         "http_port $($p.Port) использует intercept/transparent.",
         'Проверьте NAT/Firewall соответствие и ограничьте доступ; предпочитайте явный прокси.',
         "http_port $($p.Port) $($p.Opts -join ' ')"))
@@ -255,7 +286,7 @@ function Run-SquidChecks {
     $terms = $r.Terms | ForEach-Object { $_.ToLower().TrimStart('!') }
     if($terms.Count -gt 0 -and -not ($terms -contains 'proxy_auth' -or $terms -contains 'authenticated' -or $terms -contains 'auth' -or $terms -contains 'auth_required')){
       if(-not $Model.AuthRequiredUsed){
-        $find.Add([Finding]::new('SQ-NO-AUTHZ','MED',$r.Line,
+        $find.Add([Finding]::new('SQ-NO-AUTHZ','MED',$r.Line,$r.File,
           'Разрешающие правила без проверки аутентификации.',
           'Добавьте проверку proxy_auth REQUIRED (исключения — только для служебных ACL).',
           $r.Raw))
@@ -267,10 +298,159 @@ function Run-SquidChecks {
   # 8) Агрессивный ssl_bump на all
   foreach($b in $Model.SslBump){
     if($b.Raw -match '\ball\b' -and $b.Raw -match '\b(bump|server-first)\b'){
-      $find.Add([Finding]::new('SQ-SSL-BUMP-ALL','LOW',[int]$b.Line,
+      $find.Add([Finding]::new('SQ-SSL-BUMP-ALL','LOW',[int]$b.Line,[string]$b.File,
         "ssl_bump применяется к 'all'. Риски приватности/совместимости.",
         'Ограничьте ssl_bump доменами/категориями, используйте peek/splice по политикам.',
         $b.Raw))
+    }
+  }
+
+  # 9) Нет финального deny all (http_reply_access), если блок есть
+  if($Model.HttpReplyAccess.Count -gt 0){
+    $lastR = $Model.HttpReplyAccess[$Model.HttpReplyAccess.Count-1]
+    $denyAll = ($lastR.Action -eq 'deny') -and (($lastR.Terms | ForEach-Object { $_.ToLower() }) -contains 'all')
+    if(-not $denyAll){
+      $find.Add([Finding]::new('SQ-NO-DENY-ALL-REPLY','LOW',$null,$lastR.File,
+        "В конце 'http_reply_access' нет явного 'deny all'.",
+        "Добавьте финальное 'http_reply_access deny all'.",
+        "Последняя строка: $($lastR.Raw) (line $($lastR.Line))"))
+    }
+  }
+
+  # 10) Экстра-проверки по всем строкам/файлам
+  $extra = Run-ExtraChecks -Model $Model
+  foreach($f in $extra){ $find.Add($f) }
+
+  return ,$find
+}
+
+function Run-ExtraChecks {
+  param([Model]$Model)
+  $find = New-Object System.Collections.Generic.List[Finding]
+  $records = $Model.Records
+  if(-not $records -or $records.Count -eq 0){ return ,$find }
+
+  foreach($rec in $records){
+    $txt = [string]$rec.Text; $ln = [int]$rec.Line; $file = [string]$rec.File
+    if(-not $txt){ continue }
+
+    # A) Отключение проверки TLS
+    if($txt -match '^\s*sslproxy_cert_error\s+allow\s+all'){
+      $find.Add([Finding]::new('SQ-SSLPROXY-NOVERIFY','HIGH',$ln,$file,
+        'Отключена проверка ошибок сертификатов: sslproxy_cert_error allow all.',
+        'Удалите правило или оставьте точечные исключения по ACL.',
+        $txt))
+    }
+    if($txt -match 'sslproxy_(flags|options).*DONT_VERIFY_PEER'){
+      $find.Add([Finding]::new('SQ-SSLPROXY-DONT-VERIFY-PEER','HIGH',$ln,$file,
+        'Отключена проверка TLS-пиров (DONT_VERIFY_PEER).',
+        'Уберите DONT_VERIFY_PEER и включите стандартную проверку цепочки/hostname.',
+        $txt))
+    }
+
+    # B) Слабые версии/шифры для исходящего TLS
+    if($txt -match '^\s*tls_outgoing_options\s+'){
+      $isWeak = $false
+      if($txt -match 'min[-_ ]version\s*=\s*(ssl3|tls1(\.0)?|1\.0|1\.1)'){ $isWeak = $true }
+      if($txt -match 'options\s*=\s*.*NO_TLSv1_2'){ $isWeak = $true }
+      if($txt -match 'cipher\s*=\s*.*(RC4|NULL|MD5)'){ $isWeak = $true }
+      if($isWeak){
+        $find.Add([Finding]::new('SQ-TLS-OUT-WEAK','MED',$ln,$file,
+          'Слабые параметры в tls_outgoing_options (версии/шифры).',
+          'Задайте min-version=1.2/1.3, исключите слабые шифры, не отключайте TLSv1.2.',
+          $txt))
+      }
+    }
+
+    # C) Manager (cachemgr)
+    if($txt -match '^\s*http_access\s+allow\s+manager(\s|$)'){
+      if($txt -notmatch '(localhost|to_localhost)'){
+        $find.Add([Finding]::new('SQ-MANAGER-OPEN','HIGH',$ln,$file,
+          'Доступ к manager разрешён не только с localhost.',
+          'Ограничьте до localhost/to_localhost и затем запретите остальные.',
+          $txt))
+      }
+    }
+    if($txt -match '^\s*cachemgr_passwd\s+.+\s+all\s*$'){
+      $find.Add([Finding]::new('SQ-CACHEMGR-ALL','MED',$ln,$file,
+        'cachemgr_passwd выдан для "all".',
+        'Ограничьте роли и источники, не используйте all.',
+        $txt))
+    }
+
+    # D) SNMP включён, но доступы не зажаты — отметим при встрече snmp_port
+    if($txt -match '^\s*snmp_port\s+'){
+      $hasAccess = $false; $hasDenyAll = $false
+      foreach($r2 in $records){
+        $t2 = [string]$r2.Text
+        if($t2 -match '^\s*snmp_access\s+') { $hasAccess = $true }
+        if($t2 -match '^\s*snmp_access\s+deny\s+all\s*$'){ $hasDenyAll = $true }
+      }
+      if(-not $hasAccess -or -not $hasDenyAll){
+        $find.Add([Finding]::new('SQ-SNMP-OPEN','MED',$ln,$file,
+          'SNMP включён, но нет строгих snmp_access и финального deny all.',
+          'Добавьте ACL источников и "snmp_access deny all" в конце.',
+          $txt))
+      }
+    }
+
+    # E) Доверие X-Forwarded-For слишком широкое
+    if($txt -match '^\s*follow_x_forwarded_for\s+allow\s+all'){
+      $find.Add([Finding]::new('SQ-FOLLOW-XFF-ALL','MED',$ln,$file,
+        'Доверие к X-Forwarded-For для всех источников.',
+        'Разрешайте XFF только от доверенных прокси по ACL.',
+        $txt))
+    }
+
+    # F) Заголовки: широкое allow
+    if($txt -match '^\s*(request_header_access|reply_header_access)\s+.+\s+allow\s+all\s*$'){
+      $find.Add([Finding]::new('SQ-HEADER-ALLOW-ALL','LOW',$ln,$file,
+        'Разрешение заголовков для всех (риск утечки).',
+        'Пересмотрите: ограничьте конкретные заголовки и источники.',
+        $txt))
+    }
+
+    # G) Чрезмерно широкие домены/регексы
+    if($txt -match '^\s*http_access\s+allow\s+.*\bdstdomain\s+(\.|\*)\s*$'){
+      $find.Add([Finding]::new('SQ-DSTDOMAIN-ALL','HIGH',$ln,$file,
+        'Разрешение на все домены через dstdomain . / *.',
+        'Замените на перечень необходимых доменов/категорий.',
+        $txt))
+    }
+
+    # H) never_direct allow all
+    if($txt -match '^\s*never_direct\s+allow\s+all\s*$'){
+      $find.Add([Finding]::new('SQ-NEVER-DIRECT-ALL','LOW',$ln,$file,
+        'never_direct allow all — всякий исходящий трафик через peer.',
+        'Проверьте политику маршрутизации и сузьте ACL.',
+        $txt))
+    }
+
+    # I) cache_peer без ограничений (эвристика на наличие управляющих правил)
+    if($txt -match '^\s*cache_peer\s+'){
+      $hasCtl = $false
+      foreach($r2 in $records){
+        $t2=[string]$r2.Text
+        if($t2 -match '^\s*(never_direct|always_direct|cache_peer_access)\s+'){ $hasCtl=$true; break }
+      }
+      if(-not $hasCtl){
+        $find.Add([Finding]::new('SQ-CACHE-PEER-OPEN','MED',$ln,$file,
+          'Есть cache_peer, но не видно ограничений (never/always_direct или cache_peer_access).',
+          'Добавьте cache_peer_access и правила маршрутизации для контроля использования peer.',
+          $txt))
+      }
+    }
+
+    # J) ICAP/Adaptation allow all
+    if($txt -match '^\s*(icap_enable|icap_service)\b'){
+      foreach($r2 in $records){
+        if([string]$r2.Text -match '^\s*adaptation_access\s+allow\s+all\s*$'){
+          $find.Add([Finding]::new('SQ-ICAP-ALLOW-ALL','LOW',[int]$r2.Line,[string]$r2.File,
+            'adaptation_access allow all с ICAP.',
+            'Ограничьте по ACL, применяйте точечно.',
+            [string]$r2.Text))
+        }
+      }
     }
   }
 
@@ -281,14 +461,13 @@ function Run-SquidChecks {
 #region Output
 function Write-Table {
   param([System.Collections.Generic.List[Finding]]$Findings)
-  if(-not $Findings -or $Findings.Count -eq 0){
-    Write-Host "✔ Проблем не обнаружено."
-    return
-  }
-  "{0,-4}  {1,-18}  {2,-6}  {3}" -f 'SEV','ID','LINE','MESSAGE'
-  ('-'*88)
+  if(-not $Findings -or $Findings.Count -eq 0){ Write-Host "✔ Проблем не обнаружено."; return }
+  "{0,-4}  {1,-22}  {2,-6}  {3}" -f 'SEV','ID','LINE','MESSAGE'
+  ('-'*100)
   foreach($x in $Findings){
-    "{0,-4}  {1,-18}  {2,-6}  {3}" -f $x.Severity, $x.Id, ($(if($null -ne $x.Line){$x.Line}else{'-'})), $x.Message
+    $loc = if($null -ne $x.Line){ "$($x.File):$($x.Line)" } else { "$($x.File)" }
+    "{0,-4}  {1,-22}  {2,-6}  {3}" -f $x.Severity, $x.Id, ($(if($null -ne $x.Line){$x.Line}else{'-'})), $x.Message
+    "  ↳ at: {0}" -f $loc
     "  ↳ evidence: {0}" -f $x.Evidence
     "  ↳ fix: {0}" -f $x.Recommendation
   }
@@ -297,7 +476,7 @@ function Out-Json {
   param([System.Collections.Generic.List[Finding]]$Findings)
   $Findings | ForEach-Object {
     [pscustomobject]@{
-      id = $_.Id; severity = $_.Severity; line = $_.Line
+      id = $_.Id; severity = $_.Severity; line = $_.Line; file = $_.File
       message = $_.Message; recommendation = $_.Recommendation; evidence = $_.Evidence
     }
   } | ConvertTo-Json -Depth 4
@@ -307,8 +486,7 @@ function Out-Json {
 #region CLI
 function Invoke-SquidAudit {
   param([string]$ConfPath,[string]$OutFormat='Table')
-  $lines = Load-Lines -FilePath $ConfPath
-  $model = Parse-SquidConfig -Lines $lines
+  $model = Parse-SquidConfig -RootFile $ConfPath
   $findings = Run-SquidChecks -Model $model
 
   if($OutFormat -eq 'Json'){ Out-Json -Findings $findings | Write-Output }
@@ -319,11 +497,6 @@ function Invoke-SquidAudit {
   else{ exit 0 }
 }
 
-try {
-  Invoke-SquidAudit -ConfPath $Path -OutFormat $Format
-} catch {
-  Write-Error $_.Exception.Message
-  exit 4
-}
+try { Invoke-SquidAudit -ConfPath $Path -OutFormat $Format }
+catch { Write-Error $_.Exception.Message; exit 4 }
 #endregion
-
