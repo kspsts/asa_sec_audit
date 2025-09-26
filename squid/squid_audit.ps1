@@ -323,34 +323,68 @@ function Run-ExtraChecks {
   $records = $Model.Records
   if(-not $records -or $records.Count -eq 0){ return ,$find }
 
+  # Агрегируем признаки TLS
+  $hasTlsOutgoingOptions = $false
+  $hasHttpsPort          = $false
+  $hasSslProxyDirective  = $false   # любая sslproxy_*
+  $hasSslBump            = $false
+  $hasSslProxyCert       = $false
+  $hasSslProxyKey        = $false
+  $hasSslProxyCaFile     = $false
+
   foreach($rec in $records){
     $txt = [string]$rec.Text; $ln = [int]$rec.Line; $file = [string]$rec.File
     if(-not $txt){ continue }
 
+    # ===== УЖЕ ИМЕЮЩИЕСЯ TLS-ПРОВЕРКИ =====
     if($txt -match '^\s*sslproxy_cert_error\s+allow\s+all'){
-      $find.Add([Finding]::new('SQ-SSLPROXY-NOVERIFY','HIGH',$ln,$file,'Отключена проверка ошибок сертификатов: sslproxy_cert_error allow all.','Удалите правило или оставьте точечные исключения по ACL.',$txt))
+      $find.Add([Finding]::new('SQ-SSLPROXY-NOVERIFY','HIGH',$ln,$file,
+        'Отключена проверка ошибок сертификатов: sslproxy_cert_error allow all.',
+        'Удалите правило или оставьте точечные исключения по ACL.',
+        $txt))
     }
     if($txt -match 'sslproxy_(flags|options).*DONT_VERIFY_PEER'){
-      $find.Add([Finding]::new('SQ-SSLPROXY-DONT-VERIFY-PEER','HIGH',$ln,$file,'Отключена проверка TLS-пиров (DONT_VERIFY_PEER).','Уберите DONT_VERIFY_PEER и включите стандартную проверку цепочки/hostname.',$txt))
+      $find.Add([Finding]::new('SQ-SSLPROXY-DONT-VERIFY-PEER','HIGH',$ln,$file,
+        'Отключена проверка TLS-пиров (DONT_VERIFY_PEER).',
+        'Уберите DONT_VERIFY_PEER и включите стандартную проверку цепочки/hostname.',
+        $txt))
     }
-
     if($txt -match '^\s*tls_outgoing_options\s+'){
+      $hasTlsOutgoingOptions = $true
       $weak = $false
       if($txt -match 'min[-_ ]version\s*=\s*(ssl3|tls1(\.0)?|1\.0|1\.1)'){ $weak = $true }
       if($txt -match 'options\s*=\s*.*NO_TLSv1_2'){ $weak = $true }
       if($txt -match 'cipher\s*=\s*.*(RC4|NULL|MD5)'){ $weak = $true }
       if($weak){
-        $find.Add([Finding]::new('SQ-TLS-OUT-WEAK','MED',$ln,$file,'Слабые параметры в tls_outgoing_options (версии/шифры).','Задайте min-version=1.2/1.3, исключите слабые шифры, не отключайте TLSv1.2.',$txt))
+        $find.Add([Finding]::new('SQ-TLS-OUT-WEAK','MED',$ln,$file,
+          'Слабые параметры в tls_outgoing_options (версии/шифры).',
+          'Задайте min-version=1.2/1.3, исключите слабые шифры, не отключайте TLSv1.2.',
+          $txt))
       }
     }
 
+    # ===== НОВОЕ: индикаторы TLS-конфигурации =====
+    if($txt -match '^\s*https?_port\b'){ $hasHttpsPort = $true }          # httpS_port (и иногда https_port)
+    if($txt -match '^\s*sslproxy_'){ $hasSslProxyDirective = $true }      # любые sslproxy_*
+    if($txt -match '^\s*ssl_bump\b'){ $hasSslBump = $true }
+    if($txt -match '^\s*sslproxy_cert\b'){ $hasSslProxyCert = $true }
+    if($txt -match '^\s*sslproxy_key\b'){  $hasSslProxyKey  = $true }
+    if($txt -match '^\s*sslproxy_cafile\b'){ $hasSslProxyCaFile = $true }
+
+    # ===== ПРОЧИЕ УЖЕ ИМЕЮЩИЕСЯ ПРОВЕРКИ (без изменений) =====
     if($txt -match '^\s*http_access\s+allow\s+manager(\s|$)'){
       if($txt -notmatch '(localhost|to_localhost)'){
-        $find.Add([Finding]::new('SQ-MANAGER-OPEN','HIGH',$ln,$file,'Доступ к manager разрешён не только с localhost.','Ограничьте до localhost/to_localhost и затем запретите остальные.',$txt))
+        $find.Add([Finding]::new('SQ-MANAGER-OPEN','HIGH',$ln,$file,
+          'Доступ к manager разрешён не только с localhost.',
+          'Ограничьте до localhost/to_localhost и затем запретите остальные.',
+          $txt))
       }
     }
     if($txt -match '^\s*cachemgr_passwd\s+.+\s+all\s*$'){
-      $find.Add([Finding]::new('SQ-CACHEMGR-ALL','MED',$ln,$file,'cachemgr_passwd выдан для "all".','Ограничьте роли и источники, не используйте all.',$txt))
+      $find.Add([Finding]::new('SQ-CACHEMGR-ALL','MED',$ln,$file,
+        'cachemgr_passwd выдан для "all".',
+        'Ограничьте роли и источники, не используйте all.',
+        $txt))
     }
 
     if($txt -match '^\s*snmp_port\s+'){
@@ -361,24 +395,39 @@ function Run-ExtraChecks {
         if($t2 -match '^\s*snmp_access\s+deny\s+all\s*$'){ $hasDenyAll = $true }
       }
       if(-not $hasAccess -or -not $hasDenyAll){
-        $find.Add([Finding]::new('SQ-SNMP-OPEN','MED',$ln,$file,'SNMP включён, но нет строгих snmp_access и финального deny all.','Добавьте ACL источников и "snmp_access deny all" в конце.',$txt))
+        $find.Add([Finding]::new('SQ-SNMP-OPEN','MED',$ln,$file,
+          'SNMP включён, но нет строгих snmp_access и финального deny all.',
+          'Добавьте ACL источников и "snmp_access deny all" в конце.',
+          $txt))
       }
     }
 
     if($txt -match '^\s*follow_x_forwarded_for\s+allow\s+all'){
-      $find.Add([Finding]::new('SQ-FOLLOW-XFF-ALL','MED',$ln,$file,'Доверие к X-Forwarded-For для всех источников.','Разрешайте XFF только от доверенных прокси по ACL.',$txt))
+      $find.Add([Finding]::new('SQ-FOLLOW-XFF-ALL','MED',$ln,$file,
+        'Доверие к X-Forwarded-For для всех источников.',
+        'Разрешайте XFF только от доверенных прокси по ACL.',
+        $txt))
     }
 
     if($txt -match '^\s*(request_header_access|reply_header_access)\s+.+\s+allow\s+all\s*$'){
-      $find.Add([Finding]::new('SQ-HEADER-ALLOW-ALL','LOW',$ln,$file,'Разрешение заголовков для всех (риск утечки).','Пересмотрите: ограничьте конкретные заголовки и источники.',$txt))
+      $find.Add([Finding]::new('SQ-HEADER-ALLOW-ALL','LOW',$ln,$file,
+        'Разрешение заголовков для всех (риск утечки).',
+        'Пересмотрите: ограничьте конкретные заголовки и источники.',
+        $txt))
     }
 
     if($txt -match '^\s*http_access\s+allow\s+.*\bdstdomain\s+(\.|\*)\s*$'){
-      $find.Add([Finding]::new('SQ-DSTDOMAIN-ALL','HIGH',$ln,$file,'Разрешение на все домены через dstdomain . / *.','Замените на перечень необходимых доменов/категорий.',$txt))
+      $find.Add([Finding]::new('SQ-DSTDOMAIN-ALL','HIGH',$ln,$file,
+        'Разрешение на все домены через dstdomain . / *.',
+        'Замените на перечень необходимых доменов/категорий.',
+        $txt))
     }
 
     if($txt -match '^\s*never_direct\s+allow\s+all\s*$'){
-      $find.Add([Finding]::new('SQ-NEVER-DIRECT-ALL','LOW',$ln,$file,'never_direct allow all — весь исходящий трафик через peer.','Проверьте политику маршрутизации и сузьте ACL.',$txt))
+      $find.Add([Finding]::new('SQ-NEVER-DIRECT-ALL','LOW',$ln,$file,
+        'never_direct allow all — весь исходящий трафик через peer.',
+        'Проверьте политику маршрутизации и сузьте ACL.',
+        $txt))
     }
 
     if($txt -match '^\s*cache_peer\s+'){
@@ -388,21 +437,60 @@ function Run-ExtraChecks {
         if($t2 -match '^\s*(never_direct|always_direct|cache_peer_access)\s+'){ $hasCtl=$true; break }
       }
       if(-not $hasCtl){
-        $find.Add([Finding]::new('SQ-CACHE-PEER-OPEN','MED',$ln,$file,'Есть cache_peer, но не видно ограничений (never/always_direct или cache_peer_access).','Добавьте cache_peer_access и правила маршрутизации для контроля использования peer.',$txt))
+        $find.Add([Finding]::new('SQ-CACHE-PEER-OPEN','MED',$ln,$file,
+          'Есть cache_peer, но не видно ограничений (never/always_direct или cache_peer_access).',
+          'Добавьте cache_peer_access и правила маршрутизации для контроля использования peer.',
+          $txt))
       }
     }
 
     if($txt -match '^\s*(icap_enable|icap_service)\b'){
       foreach($r2 in $records){
         if([string]$r2.Text -match '^\s*adaptation_access\s+allow\s+all\s*$'){
-          $find.Add([Finding]::new('SQ-ICAP-ALLOW-ALL','LOW',[int]$r2.Line,[string]$r2.File,'adaptation_access allow all с ICAP.','Ограничьте по ACL, применяйте точечно.',[string]$r2.Text))
+          $find.Add([Finding]::new('SQ-ICAP-ALLOW-ALL','LOW',[int]$r2.Line,[string]$r2.File,
+            'adaptation_access allow all с ICAP.',
+            'Ограничьте по ACL, применяйте точечно.',
+            [string]$r2.Text))
         }
       }
     }
+  } # end foreach record
+
+  # ===== НОВЫЕ ИТОГОВЫЕ TLS-ПРОВЕРКИ =====
+
+  # 1) TLS нигде не задействован (ни ports, ни sslproxy, ни bump, ни tls_outgoing_options)
+  if(-not $hasHttpsPort -and -not $hasSslProxyDirective -and -not $hasSslBump -and -not $hasTlsOutgoingOptions){
+    # Привяжем к основному файлу, если известен
+    $rootFile = $null
+    if($records.Count -gt 0){ $rootFile = [string]$records[0].File }
+    $find.Add([Finding]::new('SQ-TLS-NOT-CONFIGURED','LOW',$null,$rootFile,
+      'В конфигурации не замечены TLS-настройки (работа без шифрования/валидации).',
+      'Настройте TLS: https_port/ssl_bump при необходимости, tls_outgoing_options и sslproxy_cafile для проверки цепочки.',
+      'No https_port/ssl_bump/sslproxy_*/tls_outgoing_options'))
+  }
+
+  # 2) Используется ssl_bump, но нет сертификата/ключа для MITM
+  if($hasSslBump -and (-not $hasSslProxyCert -or -not $hasSslProxyKey)){
+    $miss = @()
+    if(-not $hasSslProxyCert){ $miss += 'sslproxy_cert' }
+    if(-not $hasSslProxyKey){  $miss += 'sslproxy_key'  }
+    $find.Add([Finding]::new('SQ-SSL-BUMP-NO-CERT','MED',$null,$null,
+      'Включён ssl_bump, но отсутствуют обязательные параметры: ' + ($miss -join ', ') + '.',
+      'Добавьте sslproxy_cert и sslproxy_key для корректного bump (перехвата TLS).',
+      'ssl_bump present; missing: ' + ($miss -join ', ')))
+  }
+
+  # 3) Есть ssl_bump/sslproxy_*, но нет доверенного CA для проверки внешних серверов
+  if(($hasSslBump -or $hasSslProxyDirective) -and (-not $hasSslProxyCaFile)){
+    $find.Add([Finding]::new('SQ-SSLPROXY-NO-CAFILE','MED',$null,$null,
+      'Отсутствует sslproxy_cafile — проверки цепочки серверных сертификатов могут работать некорректно.',
+      'Укажите sslproxy_cafile с корневыми/промежуточными сертификатами, соответствующими вашей политике.',
+      'sslproxy_* or ssl_bump present; missing sslproxy_cafile'))
   }
 
   return ,$find
 }
+
 
 #----------------------------- Вывод -----------------------------
 function Write-Table {
